@@ -1,0 +1,32 @@
+# Audio Hub Required Packages
+# Raspberry Pi OS 64-bit (Debian Trixie)
+# Generated from: dpkg -l | grep -E "pipewire|wireplumber|bluez|python3"
+
+# Audio Stack (Pinned versions from tested build)
+pipewire:arm64=1.4.2-1+rpt3
+pipewire-audio:arm64=1.4.2-1+rpt3
+pipewire-alsa:arm64=1.4.2-1+rpt3
+pipewire-bin:arm64=1.4.2-1+rpt3
+pipewire-pulse:arm64=1.4.2-1+rpt3
+libpipewire-0.3-0:arm64=1.4.2-1+rpt3
+libpipewire-0.3-common=1.4.2-1+rpt3
+wireplumber:arm64=0.5.8-2
+libwireplumber-0.5-0:arm64=0.5.8-2
+
+# Bluetooth
+bluez:arm64=5.82-1.1+rpt1
+bluez-firmware=1.2-13+rpt2
+bluez-obexd:arm64=5.82-1.1+rpt1
+bluez-tools=2.0~20170911.0.7cb788c-4+b2
+libspa-0.2-bluetooth:arm64=1.4.2-1+rpt3
+
+# Python Dependencies
+python3-evdev
+python3-paho-mqtt
+python3-pulsectl
+
+# Network
+network-manager
+
+# System
+argonone-fan

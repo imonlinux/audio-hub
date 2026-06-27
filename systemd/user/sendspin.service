@@ -1,0 +1,30 @@
+[Unit]
+Description=Sendspin Music Assistant Client
+Documentation=https://github.com/TheRealLurpp/sendspin
+After=pipewire.service wireplumber.service pipewire-pulse.service
+Wants=pipewire.service wireplumber.service pipewire-pulse.service
+PartOf=pipewire.service
+
+[Service]
+Type=simple
+# Set stable application name for routing and detection
+Environment=PULSE_PROP_application.name=sendspin
+Environment=PULSE_PROP_media.name=sendspin
+# Route to bus.music by stable name
+Environment=PULSE_SINK=bus.music
+Environment=PIPEWIRE_ALSA_SINK=bus.music
+Environment=PIPEWIRE_NODE=bus.music
+# Sendspin-specific settings from unit config
+Environment=SENDSPIIN_PLAYER_NAME=${AUDIOHUB_PLAYER_NAME:-Living Room}
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/home/pi/.local/bin/sendspin daemon
+Restart=always
+RestartSec=3
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

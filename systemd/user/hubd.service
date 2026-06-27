@@ -1,0 +1,26 @@
+[Unit]
+Description=Audio Hub Controller Daemon
+Documentation=file:///home/pi/Project/audio-hub/README.md
+After=pipewire.service wireplumber.service pipewire-pulse.service sendspin.service
+Wants=pipewire.service wireplumber.service pipewire-pulse.service
+
+# Wait for PipeWire socket and optional MQTT broker
+# Network services must tolerate broker downtime
+[Service]
+Type=simple
+Environment=PYTHONUNBUFFERED=1
+Environment=AUDIOHUB_CONFIG=/etc/audiohub/unit.env
+
+ExecStart=/home/pi/.local/bin/hubd
+Restart=always
+RestartSec=3
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+# Allow access to input devices for IR
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+DeviceAllow=/dev/input/by-id/usb-flirc.tv_flirc_*-event-kbd rw
+
+[Install]
+WantedBy=default.target
