@@ -1,6 +1,6 @@
 # Audio Hub
 
-**Fresh implementation** of the Living Room Audio Hub for Raspberry Pi 4B.
+**Fresh implementation** of the Audio Hub for Raspberry Pi 4B.
 
 A self-contained audio hub that mixes three sources (TV optical, Bluetooth A2DP, Music Assistant) to a single analog output, with priority ducking, IR remote control, and Home Assistant integration.
 
