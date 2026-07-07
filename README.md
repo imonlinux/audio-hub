@@ -1,5 +1,11 @@
 # Audio Hub
 
+> **⚠️ WORK IN PROGRESS — NOT IN A WORKING STATE**
+>
+> This project is under active development. The core audio routing configuration has been created but is **untested**. Do not use this in production yet.
+>
+> See the [Status](#status) section below for current progress.
+
 **Fresh implementation** of the Audio Hub for Raspberry Pi 4B.
 
 A self-contained audio hub that mixes three sources (TV optical, Bluetooth A2DP, Music Assistant) to a single analog output, with priority ducking, IR remote control, and Home Assistant integration.
