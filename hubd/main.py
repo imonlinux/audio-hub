@@ -31,6 +31,8 @@ import logging
 import os
 import select
 import signal
+import struct
+import subprocess
 import sys
 import threading
 import time
@@ -83,6 +85,8 @@ class HubConfig:
     duct_tv: str = "duct.tv"
     duct_bt: str = "duct.bt"
     tv_source_pattern: str = "UR23"
+    tv_probe_interval: float = 10.0
+    tv_probe_threshold: float = 100.0
 
     # Ducking
     ducking_enabled: bool = True
@@ -132,6 +136,8 @@ class HubConfig:
             duct_tv=props.get("AUDIOHUB_DUCT_TV", "duct.tv"),
             duct_bt=props.get("AUDIOHUB_DUCT_BT", "duct.bt"),
             tv_source_pattern=props.get("AUDIOHUB_TV_SOURCE_PATTERN", "UR23"),
+            tv_probe_interval=get_float("AUDIOHUB_TV_PROBE_INTERVAL", 10.0),
+            tv_probe_threshold=get_float("AUDIOHUB_TV_PROBE_THRESHOLD", 100.0),
             ducking_enabled=get_bool("AUDIOHUB_DUCKING_ENABLED", True),
             duck_level=get_float("AUDIOHUB_DUCK_LEVEL", 0.20),
             duck_restore_delay=get_float("AUDIOHUB_DUCK_RESTORE_DELAY", 2.0),
@@ -185,6 +191,8 @@ class DuckingEngine:
         self._inactive_since: float | None = None
         self._pulse = None
         self._on_change = None
+        self._tv_probe_at: float | None = None
+        self._tv_cached = False
         # Last published status snapshot; published whenever it changes.
         self.state = {
             "ducking_enabled": config.ducking_enabled,
@@ -341,32 +349,53 @@ class DuckingEngine:
             return False
 
     def _tv_active(self) -> bool:
-        """TV presence = the UR23 is actually receiving S/PDIF signal.
+        """TV Playing = the UR23 is receiving non-silent audio.
 
-        Two-stage check: the source node must exist AND the ALSA PCM must
-        report 'Status: Running' in /proc. The node persists (and even stays
-        pulse-RUNNING, since the loopback consumes it) with the TV off, so
-        neither existence nor pulse state alone is truthful."""
+        This needs an actual level measurement: the UR23 free-runs its
+        internal 48 kHz clock and streams digital silence whenever the
+        capture is open (verified: TV unplugged from power still yields
+        'Status: Running, Momentary freq = 48000' and an all-zero stream),
+        so neither pulse state nor /proc status indicates signal presence.
+        Probing is rate-limited to once per TV_PROBE_INTERVAL seconds; the
+        cached result is reused between probes."""
+        now = time.monotonic()
+        if self._tv_probe_at is not None and now < self._tv_probe_at:
+            return self._tv_cached
+        self._tv_probe_at = now + self.cfg.tv_probe_interval
+        self._tv_cached = self._probe_tv_level()
+        return self._tv_cached
+
+    def _probe_tv_level(self) -> bool:
+        """Record ~0.3 s of raw samples from the UR23 and measure RMS.
+        pw-record has no duration option, so use --raw on stdout with a
+        short timeout: on SIGKILL the already-flushed bytes are still
+        delivered via TimeoutExpired.stdout — enough for an RMS reading."""
         try:
             pat = self.cfg.tv_source_pattern.lower()
-            node_present = False
+            target = None
             for s in self._pulse.source_list():
                 if pat in (s.name or "").lower() or pat in (s.description or "").lower():
-                    node_present = True
+                    target = s.name
                     break
-            if not node_present:
+            if target is None:
                 return False
-            for stream in glob.glob("/proc/asound/card*/stream0"):
-                try:
-                    with open(stream) as f:
-                        txt = f.read()
-                except OSError:
-                    continue
-                if "UR23" in txt:
-                    return "Status: Running" in txt
+            data = b""
+            try:
+                r = subprocess.run(
+                    ["pw-record", "--raw", "--target", target, "--rate", "48000",
+                     "--channels", "2", "--format", "s16", "-"],
+                    capture_output=True, timeout=0.35)
+                data = r.stdout or b""
+            except subprocess.TimeoutExpired as e:
+                data = e.stdout or b""
+            if len(data) < 4096:
+                return False
+            samples = struct.unpack(f"<{len(data) // 2}h", data)
+            rms = (sum(x * x for x in samples[::4]) / max(1, len(samples) // 4)) ** 0.5
+            return rms > self.cfg.tv_probe_threshold
         except Exception as e:
-            log.debug(f"tv_active check failed: {e}")
-        return False
+            log.debug(f"tv level probe failed: {e}")
+            return False
 
     # -- actuation ------------------------------------------------------------
     @staticmethod

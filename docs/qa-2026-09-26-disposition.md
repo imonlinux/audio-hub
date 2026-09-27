@@ -221,18 +221,29 @@ against the last published values and only deltas are published. HA stays
 truthful about changes made outside hubd (wpctl, manual `pactl`, an older
 daemon instance) without retained-message churn.
 
-### 3.10 — TV Playing sensor — ACCEPTED AND EXTENDED
+### 3.10 — TV Playing sensor — ACCEPTED AND EXTENDED (two rounds)
 
 The QA is right that node existence is wrong, but the suggested pulse state
 was *also* insufficient: with suspend disabled and the loopback consuming it,
 the UR23 source stays pulse-RUNNING even with the TV off (verified on
 master-bedroom: `86 alsa_input.usb-HiFimeDIY…RUNNING` while the TV was off).
-Final implementation reads the ALSA layer: the sensor is ON only when the
-UR23's `/proc/asound/card*/stream0` reports `Status: Running` — i.e. real
-S/PDIF signal lock. Hardware note discovered en route: master-bedroom's UR23
-stays locked at 48 kHz with the TV in standby (optical passthrough live),
-while living-room's PCM fully stops — so "signal present on the wire" is the
-only honest definition of this sensor.
+
+A second approach — checking `Status: Running` in `/proc/asound` — was then
+**disproven by the TV-unplugged test**: with the TV completely removed from
+power, the UR23 PCM *still* reports `Status: Running, Momentary freq =
+48000 Hz`. The receiver free-runs on its internal clock whenever the capture
+is open, streaming pure digital silence (measured: RMS 0.0, peak 0, a single
+distinct sample value across 135,168 frames).
+
+Final implementation: a **rate-limited level probe**. Every 10 s hubd records
+~0.35 s of raw samples from the UR23 (`pw-record --raw` on stdout, SIGKILLed
+after timeout — the already-flushed bytes arrive via
+`TimeoutExpired.stdout`) and measures RMS. The sensor is ON only when
+non-silent audio is actually arriving. Verified on both units with the TV
+unplugged: `tv/active = OFF`. Hardware note: master-bedroom's UR23 stays
+locked at 48 kHz with the TV in standby (optical passthrough live), while
+living-room's PCM fully stops — so "signal present on the wire" is the only
+honest definition of this sensor.
 
 ### 3.11 — validate.sh UR23 / Audio Sink — PARTIALLY ACCEPTED
 
@@ -293,8 +304,14 @@ waiting for power before powering on was circular.
 
 ## 6. Open items
 
-1. **TV unplugged test** (in progress at time of writing): full power removal
-   and reconnect, watching `pw-link -l` for loopback survival and re-link.
+1. ~~**TV unplugged test**~~ — **DONE (2026-09-26 evening).** With the TV
+   fully removed from power: hub reboot clean (validate 21/21, no rogue
+   links, ducts normalized, BT/Sendspin untouched); the analog-stereo
+   loopback stayed linked to the persisting UR23 node; the UR23 proved to
+   free-run digital silence (all-zero stream, RMS 0.0) — which retired the
+   `/proc`-based sensor approach in favour of the level probe (§3.10).
+   Expected next: on plug-in, the sensor returns ON and TV audio flows
+   through the already-linked loopback.
 2. Optional: WiFi health logger/watchdog from the second deployment.
 3. Optional: HA player-state link if pause semantics ever change upstream in
    Sendspin/MA (the hooks currently cover it).
