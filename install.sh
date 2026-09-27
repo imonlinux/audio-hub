@@ -93,6 +93,14 @@ ensure_user_setup() {
     # start at boot with nobody logged in. THE critical reboot fix.
     loginctl enable-linger "$PI_USER"
 
+    # The official sendspin installer creates a dedicated system user whose
+    # lingering session runs a SECOND PipeWire instance at boot — disable
+    # its linger so only the hub user's audio stack exists.
+    if id sendspin &>/dev/null; then
+        loginctl disable-linger sendspin 2>/dev/null || true
+        log_info "Disabled linger for legacy 'sendspin' user (second audio stack)"
+    fi
+
     if [ ! -d "/run/user/$PI_UID" ]; then
         log_warn "User manager not running yet for $PI_USER; starting it via linger..."
         systemctl start "user@$PI_UID.service" 2>/dev/null || true
@@ -105,7 +113,7 @@ remove_legacy() {
     # the declarative graph. No-ops on fresh installs (nothing matches).
     log_info "Removing legacy v1 services and configs..."
 
-    local units="pw-static-links pw-vsink-watchdog pw-ur23-loopback audio-hub-mqtt duck-monitor filter-chain"
+    local units="pw-static-links pw-vsink-watchdog pw-ur23-loopback audio-hub-mqtt duck-monitor filter-chain audio-hub-ducts"
     if [ -d "/run/user/$PI_UID" ]; then
         local u
         for u in $units; do
@@ -213,11 +221,13 @@ install_sendspin() {
         as_pi "$PI_HOME/.local/bin/uv" tool upgrade sendspin || true
     fi
 
-    # Boot-time settings sync + device index detection
+    # Boot-time settings sync (identity + stable device name + hooks)
     local local_bin="$PI_HOME/.local/bin"
     mkdir -p "$local_bin"
     install -o "$PI_USER" -g "$PI_USER" -m 755 \
         "$REPO_DIR/scripts/sendspin-detect-device.sh" "$local_bin/sendspin-detect-device.sh"
+    install -o "$PI_USER" -g "$PI_USER" -m 755 \
+        "$REPO_DIR/scripts/audiohub-music-hook" "$local_bin/audiohub-music-hook"
 
     log_info "Sendspin installed ($bin)"
 }
@@ -269,7 +279,7 @@ configure_wifi() {
         log_info "Tuning WiFi connection '$conn'..."
         nmcli connection modify "$conn" \
             connection.autoconnect-retries 0 \
-            auth-retries 0 \
+            connection.auth-retries 0 \
             802-11-wireless.powersave 2
     else
         log_warn "WiFi connection '$conn' not found; configure manually if needed"

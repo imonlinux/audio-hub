@@ -95,7 +95,8 @@ check_ur23() {
     # the live node must be one of them.
     mapfile -t targets < <(grep -oP 'target.object = "\Kalsa_input[^"]+' \
         "$HOME/.config/pipewire/pipewire.conf.d/40-loopback-tv.conf" 2>/dev/null)
-    live_node="$(wpctl status 2>/dev/null | grep -oP 'alsa_input\.usb-HiFimeDIY\S+(?=:)' | sort -u | head -1)"
+    # wpctl shows descriptions only; pactl exposes real node names
+    live_node="$(pactl list short sources 2>/dev/null | grep -oP 'alsa_input\.usb-HiFimeDIY\S+' | sort -u | head -1)"
     if [ -n "$live_node" ]; then
         pass "UR23 source present: $live_node"
     else
@@ -130,7 +131,25 @@ check_bluetooth() {
     if bluetoothctl show 2>/dev/null | grep -q "Audio Sink"; then
         pass "A2DP Audio Sink UUID registered"
     else
-        warn "Audio Sink UUID missing — restart bluetooth.service after WirePlumber is up"
+        fail "Audio Sink UUID missing — WirePlumber has not registered the A2DP endpoint; phones will pair but get no audio. Restart wireplumber, then bluetooth."
+    fi
+}
+
+check_no_second_stack() {
+    echo ""
+    echo "=== Single Audio Stack ==="
+    # The official sendspin installer creates a dedicated system user whose
+    # lingering session runs a second PipeWire instance at boot.
+    if id sendspin &>/dev/null; then
+        if loginctl show-user sendspin --property=Linger 2>/dev/null | grep -q yes; then
+            fail "Legacy 'sendspin' user still lingers (runs a second PipeWire) — run: loginctl disable-linger sendspin"
+        elif pgrep -u sendspin pipewire >/dev/null 2>&1; then
+            fail "A second PipeWire is running as the 'sendspin' user"
+        else
+            pass "No second audio stack (sendspin user present but not lingering)"
+        fi
+    else
+        pass "No legacy audio users"
     fi
 }
 
@@ -200,6 +219,7 @@ main() {
     check_no_feedback
     check_ur23
     check_bluetooth
+    check_no_second_stack
     check_services
     check_linger
     check_wifi

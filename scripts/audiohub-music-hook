@@ -1,0 +1,13 @@
+#!/bin/sh
+# Sendspin start/stop hook for the audio hub.
+# Sendspin runs:  audiohub-music-hook start   (playback started)
+#                 audiohub-music-hook stop    (playback stopped/paused)
+# hubd ducks TV/BT while the flag file exists. The flag lives in the user's
+# runtime dir (tmpfs), so it is cleared automatically on every reboot.
+DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/audiohub"
+mkdir -p "$DIR"
+case "$1" in
+  start) touch "$DIR/music-playing" ;;
+  stop)  rm -f "$DIR/music-playing" ;;
+  *)     echo "usage: $0 start|stop" >&2; exit 2 ;;
+esac

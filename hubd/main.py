@@ -89,6 +89,11 @@ class HubConfig:
     duck_level: float = 0.20
     duck_restore_delay: float = 2.0
     poll_interval: float = 0.5
+    # Sendspin start/stop hook flag file (optional). When its parent dir
+    # exists it authoritatively drives ducking: the hook distinguishes
+    # playing from paused/stopped, which the stream alone cannot (Sendspin
+    # keeps its stream open while paused). Empty = stream-based detection.
+    music_flag_path: str = ""
 
     # IR Remote
     ir_device_path: str = "/dev/input/by-id/usb-flirc.tv_flirc_*-event-kbd"
@@ -131,6 +136,7 @@ class HubConfig:
             duck_level=get_float("AUDIOHUB_DUCK_LEVEL", 0.20),
             duck_restore_delay=get_float("AUDIOHUB_DUCK_RESTORE_DELAY", 2.0),
             poll_interval=get_float("AUDIOHUB_POLL_INTERVAL", 0.5),
+            music_flag_path=props.get("AUDIOHUB_MUSIC_FLAG", ""),
             ir_device_path=props.get("AUDIOHUB_IR_DEVICE", "/dev/input/by-id/usb-flirc.tv_flirc_*-event-kbd"),
             ir_volume_step=get_float("AUDIOHUB_IR_VOLUME_STEP", 0.03),
         )
@@ -265,7 +271,7 @@ class DuckingEngine:
         state can restore stale values onto the recreated duct streams at
         boot (observed: June-era ducked volumes resurfacing after reboot).
         The poll loop compares actual vs expected and corrects drift."""
-        expected = self.cfg.duck_level if self.is_ducked else 1.0
+        expected = self._cubic(self.cfg.duck_level if self.is_ducked else 1.0)
         try:
             for si in self._pulse.sink_input_list():
                 node = si.proplist.get("node.name", "")
@@ -305,6 +311,18 @@ class DuckingEngine:
         return False
 
     def _music_active(self) -> bool:
+        """Music is active when Sendspin's start/stop hook flag file exists.
+
+        The hook distinguishes playing from paused/stopped, which the stream
+        alone cannot: Sendspin keeps its stream open (uncorked) while paused.
+        Hook mode engages once the flag's parent directory exists (the hook
+        script creates it on first playback); without it we fall back to
+        stream-based detection: any uncorked sink-input on bus.music.
+        """
+        flag = self.cfg.music_flag_path or os.path.join(
+            os.environ.get("XDG_RUNTIME_DIR", ""), "audiohub", "music-playing")
+        if os.path.isdir(os.path.dirname(flag)):
+            return os.path.isfile(flag)
         try:
             bus = self._find_sink(self.cfg.bus_music)
             if bus is None:
@@ -323,30 +341,43 @@ class DuckingEngine:
             return False
 
     def _tv_active(self) -> bool:
-        """Approximate TV presence: the UR23 ALSA source exists. The source
-        node only carries signal while the TV is sending PCM, and it is kept
-        non-suspending by the WirePlumber rules."""
+        """TV presence = the UR23 source is actually RUNNING (data flowing).
+
+        The node persists even with the TV off (suspend is disabled), so
+        existence alone would always read active. Pulse marks the source
+        running only while the S/PDIF signal is present and being consumed."""
         try:
             pat = self.cfg.tv_source_pattern.lower()
             for s in self._pulse.source_list():
                 if pat in (s.name or "").lower() or pat in (s.description or "").lower():
-                    return True
+                    return "running" in str(getattr(s, "state", "")).lower()
         except Exception as e:
             log.debug(f"tv_active check failed: {e}")
         return False
 
     # -- actuation ------------------------------------------------------------
+    @staticmethod
+    def _cubic(level: float) -> float:
+        """Convert perceptual loudness (1.0 = full, 0.2 = 20% loud) to the
+        cubic value PulseAudio expects. Without this, duck_level=0.20 means
+        an amplitude of 0.008 (-42 dB) — effectively silence."""
+        if 0.0 < level < 1.0:
+            return level ** (1.0 / 3.0)
+        return max(0.0, min(1.0, level))
+
     def _set_duct_level(self, level: float):
-        """Set all present duck-target duct streams to a volume level."""
+        """Set all present duck-target duct streams to a volume level
+        (level is perceptual loudness; converted to cubic here)."""
         if self._pulse is None:
             return []
+        cubic = self._cubic(level)
         targets = []
         for si in self._pulse.sink_input_list():
             node = si.proplist.get("node.name", "")
             if node in self.DUCT_NODES:
                 v = si.volume
                 for i in range(len(v.values)):
-                    v.values[i] = level
+                    v.values[i] = cubic
                 self._pulse.sink_input_volume_set(si.index, v)
                 targets.append(node)
         return targets
@@ -1053,6 +1084,32 @@ class HubDaemon:
         log.info("Shutdown requested")
         self.stop_event.set()
 
+    async def _state_sync_loop(self):
+        """Periodically compare actual audio state with what was last
+        published, so HA stays truthful about volumes changed outside hubd
+        (wpctl, another client, IR from a previous instance, ...)."""
+        last: dict = {}
+        while not self.stop_event.is_set():
+            snap = {}
+            for source, bus in (("tv", self.cfg.bus_tv), ("bt", self.cfg.bus_bt),
+                                ("music", self.cfg.bus_music)):
+                v = self.audio.get_bus_volume(bus)
+                if v is not None:
+                    snap[source] = round(v, 2)
+            m = self.audio.get_lineout_volume()
+            if m is not None:
+                snap["master"] = round(m, 2)
+            snap["muted"] = self.audio.get_lineout_mute()
+
+            for key, val in snap.items():
+                if last.get(key) != val:
+                    if key == "muted":
+                        self.mqtt.publish_mute(val)
+                    else:
+                        self.mqtt.publish_volume(key, val)
+            last = snap
+            await asyncio.sleep(2.0)
+
     async def run(self):
         log.info("Hub daemon starting")
         loop = asyncio.get_running_loop()
@@ -1071,10 +1128,12 @@ class HubDaemon:
         ]
         for t in threads:
             t.start()
+        sync_task = asyncio.create_task(self._state_sync_loop())
         try:
             await self.mqtt.run(self.stop_event)
         finally:
             self.stop_event.set()
+            sync_task.cancel()
             for t in threads:
                 t.join(timeout=3)
         log.info("Hub daemon stopped")

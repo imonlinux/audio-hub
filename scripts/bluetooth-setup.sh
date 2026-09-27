@@ -10,10 +10,12 @@ set -u
 
 rfkill unblock bluetooth 2>/dev/null || true
 
-# Wait for bluetoothd to expose the adapter (it is dbus-activated, so
-# After=bluetooth.service alone does not guarantee readiness).
+# Wait for bluetoothd to expose the controller (it is dbus-activated, so
+# After=bluetooth.service alone does not guarantee readiness). Wait for
+# EXISTENCE, not power: powering on is this script's job — the adapter may
+# legitimately be down when we get here (rfkill, AutoEnable unset).
 for _ in $(seq 1 15); do
-    if bluetoothctl show 2>/dev/null | grep -qi "Powered: yes"; then
+    if bluetoothctl list 2>/dev/null | grep -q "Controller"; then
         break
     fi
     sleep 2
