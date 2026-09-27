@@ -87,6 +87,9 @@ class HubConfig:
     tv_source_pattern: str = "UR23"
     tv_probe_interval: float = 10.0
     tv_probe_threshold: float = 100.0
+    # Once the probe hears audio, keep the sensor ON this long without a
+    # confirming probe, so quiet passages of real content don't flicker it
+    tv_sensor_hold: float = 30.0
 
     # Ducking
     ducking_enabled: bool = True
@@ -138,6 +141,7 @@ class HubConfig:
             tv_source_pattern=props.get("AUDIOHUB_TV_SOURCE_PATTERN", "UR23"),
             tv_probe_interval=get_float("AUDIOHUB_TV_PROBE_INTERVAL", 10.0),
             tv_probe_threshold=get_float("AUDIOHUB_TV_PROBE_THRESHOLD", 100.0),
+            tv_sensor_hold=get_float("AUDIOHUB_TV_SENSOR_HOLD", 30.0),
             ducking_enabled=get_bool("AUDIOHUB_DUCKING_ENABLED", True),
             duck_level=get_float("AUDIOHUB_DUCK_LEVEL", 0.20),
             duck_restore_delay=get_float("AUDIOHUB_DUCK_RESTORE_DELAY", 2.0),
@@ -191,6 +195,9 @@ class DuckingEngine:
         self._inactive_since: float | None = None
         self._pulse = None
         self._on_change = None
+        self._tv_probe_at: float | None = None
+        self._tv_cached = False
+        self._tv_hold_until = 0.0
         self._tv_probe_at: float | None = None
         self._tv_cached = False
         # Last published status snapshot; published whenever it changes.
@@ -366,13 +373,17 @@ class DuckingEngine:
         capture is open (verified: TV unplugged from power still yields
         'Status: Running, Momentary freq = 48000' and an all-zero stream),
         so neither pulse state nor /proc status indicates signal presence.
-        Probing is rate-limited to once per TV_PROBE_INTERVAL seconds; the
-        cached result is reused between probes."""
+        Probing is rate-limited to once per TV_PROBE_INTERVAL seconds and
+        the ON state holds for TV_SENSOR_HOLD seconds after the last
+        audible probe, so quiet passages don't flicker the sensor."""
         now = time.monotonic()
         if self._tv_probe_at is not None and now < self._tv_probe_at:
-            return self._tv_cached
+            return self._tv_cached or now < self._tv_hold_until
         self._tv_probe_at = now + self.cfg.tv_probe_interval
-        self._tv_cached = self._probe_tv_level()
+        on = self._probe_tv_level()
+        if on:
+            self._tv_hold_until = now + self.cfg.tv_sensor_hold
+        self._tv_cached = on or now < self._tv_hold_until
         return self._tv_cached
 
     def _probe_tv_level(self) -> bool:
