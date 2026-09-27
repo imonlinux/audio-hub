@@ -124,3 +124,4 @@ journalctl --user -u hubd.service -f
 - Python 3.11+ with system packages: `python3-paho-mqtt`, `python3-pulsectl`, `python3-evdev`
 
 See `rpi-audio-hub-howto.md` for the original (v1) setup guide — kept as a reference for device-specific facts (UR23 behavior, TV settings, USB port placement).
+See `docs/qa-2026-09-26-disposition.md` for the disposition of the external QA review: every finding, the evidence (including measurements and logs) behind accepted and rejected verdicts, and the reproducible verification commands.
