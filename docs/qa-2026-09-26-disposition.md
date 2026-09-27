@@ -20,7 +20,7 @@ hardware.
 |---|----------|--------------------|---------|--------|
 | 1 | High | Duck never releases on pause | **Accepted** | Sendspin start/stop hooks drive a flag file; hubd ducking is flag-primary. Pause verified live on MA interface. |
 | 2 | High | MA volume slider controls master volume | **Accepted** | `use_hardware_volume: false` in provisioning. Verified: flag exists in sendspin 7.5. |
-| 3 | High | TV loopbacks destroyed when target missing; add `node.linger` | **Rejected as specified** | `node.linger` does not exist in PipeWire; "WP destroys the stream" contradicted on hardware. TV off/on watch retained as a test (in progress). |
+| 3 | High | TV loopbacks destroyed when target missing; add `node.linger` | **Initially rejected — reopened after peer review; verified real and accepted** | `node.linger = true` added to both TV loopback captures. See §3.3. |
 | 4 | Medium | DUCK_LEVEL=0.20 is −42 dB on the cubic scale | **Accepted** | hubd converts perceptual → cubic (`level ** (1/3)`). This also explained master-bedroom's mysterious empirical 0.58. |
 | 5 | Medium | No guard against a second audio stack | **Partially accepted** | Hardening implemented (linger disabled, `audio-hub-ducts` cleanup, validate check). The "today's root cause for Bluetooth" attribution is contradicted by evidence — see §3.5. |
 | 6 | Medium | Device chosen by index again; use name `"pipewire"` | **Accepted** | Fixed name verified live ("Using audio device: pipewire"); index detection removed. |
@@ -187,16 +187,20 @@ the name is the stable form). Index detection removed from the provisioning
 script, which now always exits successfully (the old detect-fail loop was a
 boot-stability hazard); identity sync retained.
 
-### 3.7 — UR23 as graph clock (Medium) — ACCEPTED, WITH A CORRECTION TO THE QA'S OWN FIX
+### 3.7 — UR23 as graph clock (Medium) — ACCEPTED, WITH A CORRECTION TO MY OWN FIRST FIX
 
 The concern is sound: with suspend disabled the UR23 capture runs even
 without signal, and as graph driver a stalled S/PDIF clock degrades the other
 sources.
 
-**Correction:** the QA's implied property `node.priority.driver` is
-**silently ignored** by WirePlumber rules. Deploying it changed nothing —
-the node stayed at `priority.driver=2009` (verified with `pw-dump`). The
-working key is `priority.driver`:
+**Attribution correction (peer review):** the incorrect property name came
+from my first implementation, not from the QA — the QA referenced "the
+driver-priority rule from earlier in this project", and that earlier rule
+(`35-clock-driver.conf` on master-bedroom) used the correct
+`priority.driver`. My first deployment used `node.priority.driver`, which is
+**silently ignored** by WirePlumber rules — the node stayed at
+`priority.driver=2009` (verified with `pw-dump`) until the key was renamed.
+The working key is `priority.driver`:
 
 ```
 UR23 priority.driver=50        (after fix; was 2009)
@@ -237,11 +241,13 @@ Final implementation: a **rate-limited level probe**. Every 10 s hubd records
 ~0.35 s of raw samples from the UR23 (`pw-record --raw` on stdout, SIGKILLed
 after timeout — the already-flushed bytes arrive via
 `TimeoutExpired.stdout`) and measures RMS. The sensor is ON only when
-non-silent audio is actually arriving. Verified on both units with the TV
-unplugged: `tv/active = OFF`. Hardware note: master-bedroom's UR23 stays
-locked at 48 kHz with the TV in standby (optical passthrough live), while
-living-room's PCM fully stops — so "signal present on the wire" is the only
-honest definition of this sensor.
+non-silent audio is actually arriving, and an ON result holds for 30 s
+(`AUDIOHUB_TV_SENSOR_HOLD`) so quiet passages don't flicker it. Verified on
+both units: `tv/active = OFF` with the TV unplugged, `tv/active = ON` with
+live TV content (probes RMS 320–5007). Hardware note: master-bedroom's UR23
+free-runs its internal clock at 48 kHz whenever the capture is open — the
+"lock" is not evidence of a TV signal, which is why level is the only
+truthful measure.
 
 ### 3.11 — validate.sh UR23 / Audio Sink — PARTIALLY ACCEPTED
 
@@ -267,7 +273,28 @@ waiting for power before powering on was circular.
 
 ---
 
-## 4. Also fixed during bring-up (not in the QA report)
+## 4. Peer-review round (2026-09-26 night) — code fixes from the corrections
+
+The second deployment's maintainer reviewed the first version of this
+document; their corrections were verified against source and hardware and
+implemented in commits `59480bd`–`8c77a92`:
+
+- **Ducking flag crash-resilience**: hubd requires BOTH the hook flag AND an
+  uncorked stream on `bus.music` when hook mode is active — a sendspin crash
+  mid-song leaves the flag behind but drops the stream, so TV/BT unduck
+  instead of latching until reboot. Additionally,
+  `sendspin.service` gained `ExecStopPost=/bin/rm -f
+  %t/audiohub/music-playing` to clear the flag on every stop.
+- **validate.sh**: the second-stack check is generic — it fails if ANY user
+  other than the hub user is running PipeWire, not only the known
+  `sendspin` case.
+- **Wording**: duck level is documented as amplitude (0.20 = −14 dB),
+  replacing the earlier "loudness" phrasing.
+- **Stale header fixed**: `30-ur23.conf`'s comment block still claimed
+  `node.priority.driver = 50` after the code below it had been corrected to
+  `priority.driver`; the header now matches the code.
+
+## 5. Also fixed during bring-up (not in the QA report)
 
 - `bt-agent` is not an apt package on Debian Trixie — the binary comes from
   `bluez-tools` (the howto's package list fails on this).
@@ -287,7 +314,7 @@ waiting for power before powering on was circular.
   at boot (June-era 0.2 resurfaced after redeploy); hubd now re-asserts duct
   volumes every poll, making it the sole owner of the duct levels.
 
-## 5. Verification methodology (reproduce any claim above)
+## 6. Verification methodology (reproduce any claim above)
 
 | Claim | Command |
 |---|---|
@@ -300,7 +327,7 @@ waiting for power before powering on was circular.
 | Graph wiring | `pw-link -l` (ports and arrows print on separate lines) |
 | What MA/hubd last said | `mosquitto_sub -t "<device-id>/#" -v` (mind each unit's id style) |
 
-## 6. Open items
+## 7. Open items
 
 1. ~~**TV unplugged test**~~ — **DONE (2026-09-26 evening).** With the TV
    fully removed from power: hub reboot clean (validate 21/21, no rogue
