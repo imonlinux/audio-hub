@@ -308,8 +308,11 @@ waiting for power before powering on was circular.
    loopback stayed linked to the persisting UR23 node; the UR23 proved to
    free-run digital silence (all-zero stream, RMS 0.0) — which retired the
    `/proc`-based sensor approach in favour of the level probe (§3.10).
-   Expected next: on plug-in, the sensor returns ON and TV audio flows
-   through the already-linked loopback.
+   **Plug-in test also passed:** with the TV plugged in and turned on while
+   BT played, TV audio flowed through the already-linked loopback and BT
+   was never interrupted. With the TV on but silent (menu/pause), the
+   sensor correctly reads OFF — it measures audible audio, not merely
+   "TV present".
 2. Optional: WiFi health logger/watchdog from the second deployment.
 3. Optional: HA player-state link if pause semantics ever change upstream in
    Sendspin/MA (the hooks currently cover it).
