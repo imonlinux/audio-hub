@@ -341,16 +341,29 @@ class DuckingEngine:
             return False
 
     def _tv_active(self) -> bool:
-        """TV presence = the UR23 source is actually RUNNING (data flowing).
+        """TV presence = the UR23 is actually receiving S/PDIF signal.
 
-        The node persists even with the TV off (suspend is disabled), so
-        existence alone would always read active. Pulse marks the source
-        running only while the S/PDIF signal is present and being consumed."""
+        Two-stage check: the source node must exist AND the ALSA PCM must
+        report 'Status: Running' in /proc. The node persists (and even stays
+        pulse-RUNNING, since the loopback consumes it) with the TV off, so
+        neither existence nor pulse state alone is truthful."""
         try:
             pat = self.cfg.tv_source_pattern.lower()
+            node_present = False
             for s in self._pulse.source_list():
                 if pat in (s.name or "").lower() or pat in (s.description or "").lower():
-                    return "running" in str(getattr(s, "state", "")).lower()
+                    node_present = True
+                    break
+            if not node_present:
+                return False
+            for stream in glob.glob("/proc/asound/card*/stream0"):
+                try:
+                    with open(stream) as f:
+                        txt = f.read()
+                except OSError:
+                    continue
+                if "UR23" in txt:
+                    return "Status: Running" in txt
         except Exception as e:
             log.debug(f"tv_active check failed: {e}")
         return False
