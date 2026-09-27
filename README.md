@@ -1,139 +1,126 @@
 # Audio Hub
 
-> **⚠️ WORK IN PROGRESS — NOT IN A WORKING STATE**
->
-> This project is under active development. The core audio routing configuration has been created but is **untested**. Do not use this in production yet.
->
-> See the [Status](#status) section below for current progress.
+A self-contained audio hub for Raspberry Pi 4B: mixes three sources (TV optical, Bluetooth A2DP, Music Assistant) to a single analog output, with priority ducking, IR remote control, and Home Assistant integration.
 
-**Fresh implementation** of the Audio Hub for Raspberry Pi 4B.
-
-A self-contained audio hub that mixes three sources (TV optical, Bluetooth A2DP, Music Assistant) to a single analog output, with priority ducking, IR remote control, and Home Assistant integration.
+> **Status:** deployed on hardware (living-room-media, 2026-09-26). All three sources verified end-to-end on hardware: TV optical, Bluetooth A2DP, and Music Assistant/Sendspin all play through the hub; ducking, MQTT entities, IR remote, cold boot, broker-outage retry, and PipeWire-restart recovery all pass. Two environment-specific Bluetooth findings are documented below — they apply to any new unit.
 
 ## Design Principles
 
-1. **Declarative-first** — All audio routing via PipeWire/WirePlumber config, no pw-link scripts
-2. **Stable names only** — All routing by node.name, never numeric IDs
-3. **Event-driven** — Ducking via pulsectl events, no polling
-4. **Minimum services** — Only sendspin + hubd as custom services
-5. **Reproducible** — Git repo + idempotent installer + per-unit config
+1. **Declarative-first** — all audio routing via PipeWire/WirePlumber config; no pw-link scripts, no watchdogs. PipeWire itself reconnects declarative loopbacks after failures or reboots.
+2. **Stable names only** — routing attaches to `node.name`s (`bus.*`, `duct.*`), never numeric IDs.
+3. **Single source of truth** — `/etc/audiohub/unit.env` drives hubd, Sendspin identity, and Bluetooth naming.
+4. **Minimum services** — only `hubd` + `sendspin` (user units) and `bt-agent` + `bluetooth-setup` + `wifi-powersave-off` (system units).
+5. **Reproducible** — git repo + idempotent installer.
 
 ## Architecture
 
 ```
-TV (UR23) ──loopback──▶ [bus.tv]  ──duct.tv──▶
-Bluetooth A2DP        ──WP rule──▶ [bus.bt]  ──duct.bt──▶  [Hardware Sink] ──▶ Speakers
-Sendspin               ──WP rule──▶ [bus.music] ──duct.music──▶
+TV (UR23) ──loopback(conf)──▶ [bus.tv]  ──duct.tv──▶
+Bluetooth A2DP ──WP rule───▶ [bus.bt]  ──duct.bt──▶  [Hardware Sink] ──▶ Speakers
+Sendspin ──PIPEWIRE_NODE──▶ [bus.music] ──duct.music──▶
 ```
 
-- **Per-source volume** = volume of the corresponding bus sink
-- **Ducking** = multiplier on duct.tv and duct.bt streams (separate from source volumes)
-- **Master volume/mute** = hardware sink volume/mute
+- **Per-source volume** = volume of the corresponding bus sink (`monitor.channel-volumes = true` makes the ducts carry it)
+- **Ducking** = multiplier on the `duct.tv` / `duct.bt` playback streams (separate from source volumes)
+- **Master volume/mute** = hardware sink
 - **Clock locked to 48 kHz** — matches TV S/PDIF output
 
-## Quick Start
+hubd (single daemon) does ducking (poll, 0.5 s), MQTT/Home Assistant entities, and FLIRC IR volume/mute.
+
+## Install
 
 ```bash
-# Clone repo
-git clone <repo> /tmp/audio-hub
-cd /tmp/audio-hub
-
-# Run installer (as root for full install)
+# On the Pi, as root:
 sudo ./install.sh
 
-# Configure unit
+# Edit the unit config (MQTT credentials + device identity):
 sudo nano /etc/audiohub/unit.env
 
 # Reboot to load all configs
 sudo reboot
 ```
 
+The installer runs everything user-level as the `pi` user (override with `AUDIOHUB_USER=<name> audiohub`) and enables linger so the stack starts at boot with no login. It also installs Sendspin (`uv tool install sendspin` into the user's home).
+
+## Configuration
+
+`/etc/audiohub/unit.env` — see `unit.env.example` for all fields. Device identity, MQTT, ducking, and IR are all set there.
+
+## Services
+
+| Unit | Scope | Purpose |
+|------|-------|---------|
+| `pipewire` / `wireplumber` / `pipewire-pulse` | user | stock audio stack |
+| `hubd.service` | user | ducking + MQTT + IR daemon |
+| `sendspin.service` | user | Music Assistant client (routed to `bus.music`) |
+| `bt-agent.service` | system | auto-accept Bluetooth pairing |
+| `bluetooth-setup.service` | system | rfkill unblock + discoverable/pairable at boot |
+| `wifi-powersave-off.service` | system | WiFi power save off |
+
 ## Directory Structure
 
 ```
 audio-hub/
-├── install.sh              # Idempotent installer
-├── packages.txt            # Pinned package versions
-├── unit.env.example         # Per-unit config template
-├── README.md               # This file
+├── install.sh              # Idempotent installer (run as root)
+├── packages.txt            # apt packages (comments allowed)
+├── unit.env.example        # Per-unit config template -> /etc/audiohub/unit.env
 ├── config/
-│   ├── pipewire.conf.d/    # PipeWire drop-in configs
-│   ├── wireplumber.conf.d/ # WirePlumber rules
-│   ├── bluetooth/          # BlueZ configuration
-│   └── network/            # NetworkManager settings
+│   ├── pipewire.conf.d/    # clock, virtual buses, TV loopback, ducts
+│   ├── wireplumber.conf.d/ # UR23 rules, BT A2DP routing, Sendspin routing
+│   └── bluetooth/          # /etc/bluetooth/main.conf
 ├── systemd/
-│   ├── user/               # User service definitions
-│   └── system/             # System service definitions
-├── hubd/                   # Hub controller daemon
-│   ├── __init__.py
-│   └── main.py             # Main daemon (ducking + MQTT + IR)
-└── scripts/                # Validation and testing scripts
+│   ├── user/               # hubd.service, sendspin.service
+│   └── system/             # bt-agent, bluetooth-setup, wifi-powersave-off
+├── hubd/                   # Hub controller daemon (ducking + MQTT + IR)
+└── scripts/
+    ├── validate.sh         # Post-boot validation (run as the hub user)
+    ├── bluetooth-setup.sh  # Boot adapter bring-up (installed to /usr/local/sbin)
+    └── sendspin-detect-device.sh  # settings-daemon.json sync + device index detect
 ```
 
-## Configuration
+## Verification
 
-Edit `/etc/audiohub/unit.env` to configure:
+After a reboot, as the hub user:
 
 ```bash
-# Device identity
-AUDIOHUB_HOSTNAME=master-bedroom-media
-AUDIOHUB_DEVICE_ID=master_bedroom_media
-AUDIOHUB_DEVICE_NAME=Master Bedroom Media
-
-# MQTT
-AUDIOHUB_MQTT_HOST=192.168.0.100
-AUDIOHUB_MQTT_PORT=1883
-AUDIOHUB_MQTT_USERNAME=mqtt
-AUDIOHUB_MQTT_PASSWORD=your_password
-
-# Ducking
-AUDIOHUB_DUCKING_ENABLED=true
-AUDIOHUB_DUCK_LEVEL=0.20
-
-# IR remote
-AUDIOHUB_IR_DEVICE=/dev/input/by-id/usb-flirc.tv_flirc_*-event-kbd
-AUDIOHUB_IR_VOLUME_STEP=0.03
+bash scripts/validate.sh
+systemctl --user status hubd.service sendspin.service
+journalctl --user -u hubd.service -f
 ```
 
-## Services
+### Verified on hardware (living-room-media)
 
-### User Services (run as pi or audiohub)
+- Cold boot with TV off: services up, buses + ducts linked, no rogue links, hubd connected to MQTT, discovery published, FLIRC opened.
+- Ducking: tone into `bus.music` → `duct.tv`/`duct.bt` drop to 0.20, `duct.music` untouched, restore after hold-off.
+- MQTT: all commands (per-source/master volume, mute, ducking switch) applied and state published.
+- Resilience: PipeWire restart self-heals (stale Pulse connections retry transparently, ducking engine reconnects); broker unreachable → 5 s retries, no crash loop; sendspin device index re-detected per boot.
 
-- `pipewire.service` — Core audio server
-- `wireplumber.service` — Session manager
-- `pipewire-pulse.service` — PulseAudio compatibility
-- `sendspin.service` — Music Assistant client
-- `hubd.service` — Hub controller daemon
+### Real-world findings (fixed during bring-up)
 
-### System Services
+- **IR remote did nothing audible** — hubd logged keypresses but `IRHandler.set_loop()` was never called, so dispatch was dropped. Fixed; keypresses now adjust master volume.
+- **TV: no audio** — the UR23 node name flips between `...analog-stereo` (signal present) and `...stereo-fallback` (probing). `40-loopback-tv.conf` now loads one loopback per candidate name; exactly one can ever link.
+- **Bluetooth: phone pairs but gets no audio** — three stacked causes, each fixed:
+  1. bluetoothd segfaults occasionally; bt-agent must re-register when it does (`PartOf=bluetooth.service` + `Restart=always`), or A2DP authorization is denied.
+  2. **Do NOT add a `wireplumber.settings` block to the Bluetooth fragment.** In this environment (WP 0.5.8 + bluez 5.82) it stops the A2DP endpoint from registering — the adapter advertises no Audio Sink UUID, so phones connect, find no audio service, and disconnect (the v1 howto's `autoswitch-to-headset-profile` setting is the offender; it is deliberately omitted).
+  3. First BT playback after connecting can be digital silence: A2DP absolute volume syncs from the phone's media volume. Turning up the phone fixes it.
+- Kernel log noise (`hci0: ACL packet for unknown connection handle`, `Unexpected continuation frame`) appears on healthy units during connection setup and is benign for this firmware generation.
 
-- `wifi-powersave-off.service` — Disable WiFi power save
+### Remaining real-world checks
 
-## Status
-
-| Phase | Status | Notes |
-|-------|--------|-------|
-| Phase 0 | ✅ | Provisioning repo structure |
-| Phase 1 | 🔄 | Core audio graph (config created, untested) |
-| Phase 2 | ⏳ | Bluetooth A2DP sink |
-| Phase 3 | ⏳ | Sendspin + hubd daemon |
-| Phase 4 | ⏳ | Network resilience |
-| Phase 5 | ⏳ | Cold-boot hardening |
-| Phase 6 | ⏳ | Validation matrix |
+- **Ducking under real load**: play two sources at once (e.g. phone + Sendspin) and confirm the non-music source drops to ~20% and restores.
+- **Cold boot with TV on**: confirm TV audio flows immediately after power-on.
 
 ## Hardware
 
-- Raspberry Pi 4B
-- Hifime UR23 USB S/PDIF Receiver
-- FLIRC USB Infrared Receiver
-- Argon40 One v1 case
+- Raspberry Pi 4B (Argon40 One case)
+- Hifime UR23 USB S/PDIF receiver — **USB 3.0 port** (the FLIRC shares the USB 2.0 bus otherwise; isochronous contention distorts audio)
+- FLIRC USB IR receiver
+- TV optical out set to **PCM / Stereo** (not Auto/Dolby)
 
 ## Requirements
 
 - Raspberry Pi OS 64-bit (Debian Trixie)
-- PipeWire 1.4.2 + WirePlumber 0.5.8
-- Python 3.13 with: paho-mqtt, pulsectl, evdev
+- PipeWire ≥ 1.4.2, WirePlumber ≥ 0.5.8, BlueZ ≥ 5.82
+- Python 3.11+ with system packages: `python3-paho-mqtt`, `python3-pulsectl`, `python3-evdev`
 
-## License
-
-Custom hardware/audio hub deployment.
+See `rpi-audio-hub-howto.md` for the original (v1) setup guide — kept as a reference for device-specific facts (UR23 behavior, TV settings, USB port placement).
