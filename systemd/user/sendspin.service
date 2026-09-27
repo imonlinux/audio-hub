@@ -18,6 +18,9 @@ Environment=PULSE_PROP_media.name=sendspin
 # Exits nonzero when detection fails, so systemd retries via Restart=always.
 ExecStartPre=%h/.local/bin/sendspin-detect-device.sh
 ExecStart=%h/.local/bin/sendspin daemon
+# If the daemon dies mid-song the stop hook never runs and the ducking
+# flag would hold TV/BT down until reboot; clear it on every stop.
+ExecStopPost=/bin/rm -f %t/audiohub/music-playing
 Restart=always
 RestartSec=5
 

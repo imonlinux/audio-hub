@@ -319,10 +319,13 @@ class DuckingEngine:
         return False
 
     def _music_active(self) -> bool:
-        """Music is active when Sendspin's start/stop hook flag file exists.
+        """Music is active when Sendspin's start/stop hook flag file exists
+        AND its stream is still open.
 
         The hook distinguishes playing from paused/stopped, which the stream
         alone cannot: Sendspin keeps its stream open (uncorked) while paused.
+        Requiring BOTH covers a sendspin crash mid-song: the flag would
+        remain with no stream, and AND-ing unducks instead of latching.
         Hook mode engages once the flag's parent directory exists (the hook
         script creates it on first playback); without it we fall back to
         stream-based detection: any uncorked sink-input on bus.music.
@@ -330,7 +333,14 @@ class DuckingEngine:
         flag = self.cfg.music_flag_path or os.path.join(
             os.environ.get("XDG_RUNTIME_DIR", ""), "audiohub", "music-playing")
         if os.path.isdir(os.path.dirname(flag)):
-            return os.path.isfile(flag)
+            if not os.path.isfile(flag):
+                return False
+            try:
+                bus = self._find_sink(self.cfg.bus_music)
+                return bus is not None and self._has_uncorked_input(bus)
+            except Exception as e:
+                log.debug(f"music_active check failed: {e}")
+                return False
         try:
             bus = self._find_sink(self.cfg.bus_music)
             if bus is None:
@@ -400,9 +410,11 @@ class DuckingEngine:
     # -- actuation ------------------------------------------------------------
     @staticmethod
     def _cubic(level: float) -> float:
-        """Convert perceptual loudness (1.0 = full, 0.2 = 20% loud) to the
-        cubic value PulseAudio expects. Without this, duck_level=0.20 means
-        an amplitude of 0.008 (-42 dB) — effectively silence."""
+        """Convert a perceptual level (1.0 = full, 0.2 = 20% amplitude) to
+        the cubic value PulseAudio expects. Without this, duck_level=0.20
+        means an amplitude of 0.008 (-42 dB) — effectively silence.
+        (0.2 amplitude is -14 dB, which subjectively reads as roughly
+        35-40% loudness.)"""
         if 0.0 < level < 1.0:
             return level ** (1.0 / 3.0)
         return max(0.0, min(1.0, level))

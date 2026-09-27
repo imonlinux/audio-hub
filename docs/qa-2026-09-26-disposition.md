@@ -98,41 +98,33 @@ sets `"use_hardware_volume": false` alongside the hooks.
 **Real-world:** user-verified on master-bedroom — MA's volume control and
 the MQTT Music volume now operate independently.
 
-### 3.3 — `node.linger` / destroyed loopbacks (High) — REJECTED AS SPECIFIED
+### 3.3 — `node.linger` / destroyed loopbacks (High) — REOPENED, VERIFIED, ACCEPTED
 
-**QA claim:** WirePlumber destroys streams whose target is missing; both
-loopbacks need `node.linger = true` or TV audio cannot return after a
-TV off/on cycle.
+**Initial verdict (rejected) was wrong**, and a peer review corrected it. The
+rejection rested on a wrongly-scoped source search: `node.linger` is a
+**WirePlumber** property, not a PipeWire one. Verified after re-review:
 
-**Evidence against:**
+- WirePlumber 0.5.8's `src/scripts/linking/find-defined-target.lua`: when the
+  defined target is missing, `dont_fallback` is set, and linger is **not**,
+  the script sends an error to the client and calls `node:request_destroy()`.
+  With linger set, it logs "... waiting for defined target as dont-fallback
+  is set" instead.
+- Introduced in commit `ac508aef` ("linking: handle 'node.linger' property
+  when target node not known"); documented in
+  `docs/rst/policies/linking.rst`; and WirePlumber's own
+  `src/scripts/monitors/alsa.lua` pairs `node.dont-fallback = true` with
+  `["node.linger"] = true` — exactly the combination proposed.
+- Consequence: our loopbacks survived the TV-off reboots only because the
+  destroy request happens not to take effect on nodes owned by a module
+  inside the PipeWire daemon — accidental, and fragile across upgrades.
 
-1. **The property does not exist.** A source-tree search for
-   `node.linger` in PipeWire returns nothing:
-   `gh search code "node.linger" --repo PipeWire/pipewire` → no hits.
-   The nearest real property is `object.linger` ("If the object should
-   outlive its creator" — `pipewire-props(7)`), which is semantically
-   inapplicable: a loopback stream's creator is the PipeWire module itself,
-   which stays alive. This is the same failure mode as `stream.capture.silence`
-   (issue found earlier the same day), which also does not exist anywhere in
-   the PipeWire source.
+**Implementation:** `node.linger = true` added next to each
+`node.dont-fallback` in both TV loopback capture blocks.
 
-2. **The destruction claim is contradicted on hardware.** living-room-media
-   was rebooted at 16:16 with the TV off — exactly the "target missing" case.
-   The loopback was *not* destroyed: it sat unlinked, and when the UR23 node
-   appeared it linked and carried audio (measured at the speaker bus:
-   RMS 961 with the TV's own content). master-bedroom was rebooted with the
-   TV off at 18:07 with the same result — `loopback.tv.capture` linked to the
-   present UR23 node, `loopback.tv2` (the other candidate name) waiting.
-
-3. **The QA's own reference does not contain the proposed fix.** The master-
-   bedroom ducts file cited ("as in the version tested on your unit") contains
-   no `linger` and no `dont-fallback` on any stream (verified by grep).
-
-**Action taken instead:** the TV off/on transition is retained as an open
-*test* (see §5) — watched live with `pw-link -l` — rather than a config
-change made for an invented property. The dual-target design
-(`40-loopback-tv.conf`) already covers both observed node names, and
-`node.dont-fallback` prevents the v1-style wrong-node linking.
+**Empirical status:** with the TV unplugged from power the loopback stayed
+linked to the persisting UR23 node; the linger guard will be exercised on
+the next plug/unplug cycle (the destroy request only arises when the target
+actually vanishes, e.g. a profile flip to the other candidate name).
 
 ### 3.4 — Cubic volume scale (Medium) — ACCEPTED
 
@@ -175,8 +167,14 @@ Bluetooth" to this second stack. The proven root cause is independent of it:
 - Root cause chain, each proven: (1) the settings block disables endpoint
   registration; (2) a bluetoothd segfault killed the pairing agent, whose
   `Restart=on-failure` let a clean exit stand — fixed with
-  `PartOf=bluetooth.service` + `Restart=always`; (3) failed acquires poison
-  the A2DP SEP (`a2dp_resume() SEP in bad state`) until a full reconnect.
+  `PartOf=bluetooth.service` + `Restart=always`; (3) **the codec
+  negotiation loop**: on master-bedroom, `btmon` captured a Pixel
+  alternating between aptX HD and Google's Opus — each switch poisoned the
+  A2DP SEP (`a2dp_resume() SEP in bad state`) — and
+  `bluez5.codecs = [sbc sbc_xq aac]` in the Bluetooth fragment ended it.
+  This matters for every guest phone: codec negotiation is the first thing
+  a new device does, so the whitelist is what keeps unusual codec
+  combinations from wedging the endpoint.
 
 The second-stack hardening is good hygiene regardless of attribution.
 

@@ -138,18 +138,17 @@ check_bluetooth() {
 check_no_second_stack() {
     echo ""
     echo "=== Single Audio Stack ==="
-    # The official sendspin installer creates a dedicated system user whose
-    # lingering session runs a second PipeWire instance at boot.
-    if id sendspin &>/dev/null; then
-        if loginctl show-user sendspin --property=Linger 2>/dev/null | grep -q yes; then
-            fail "Legacy 'sendspin' user still lingers (runs a second PipeWire) — run: loginctl disable-linger sendspin"
-        elif pgrep -u sendspin pipewire >/dev/null 2>&1; then
-            fail "A second PipeWire is running as the 'sendspin' user"
-        else
-            pass "No second audio stack (sendspin user present but not lingering)"
-        fi
+    # Generic: fail if ANY user other than the current hub user is running
+    # a PipeWire daemon (the sendspin-user case is the known instance).
+    local offenders
+    offenders="$(ps -o user= -C pipewire 2>/dev/null | tr -d ' ' | sort -u | grep -v "^${USER}$" | tr '\n' ' ')"
+    if [ -n "$offenders" ]; then
+        fail "Second PipeWire instance(s) running as: ${offenders}— disable linger for those users"
     else
-        pass "No legacy audio users"
+        pass "No second audio stack (single hub user runs PipeWire)"
+    fi
+    if id sendspin &>/dev/null && loginctl show-user sendspin --property=Linger 2>/dev/null | grep -q yes; then
+        fail "Legacy 'sendspin' user still lingers — run: loginctl disable-linger sendspin"
     fi
 }
 
