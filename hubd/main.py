@@ -250,12 +250,36 @@ class DuckingEngine:
             try:
                 self._handle_pending()
                 self._check()
+                self._verify_duct_levels()
                 self._update_status()
             except Exception as e:
                 log.debug(f"ducking poll error: {e}")
             self.stop_event.wait(self.cfg.poll_interval)
         self._drop()
         log.info("Ducking engine stopped")
+
+    def _verify_duct_levels(self):
+        """Re-assert the expected duct level if anything else changed it.
+
+        Duct volumes are hubd's exclusive domain, but WirePlumber's stream
+        state can restore stale values onto the recreated duct streams at
+        boot (observed: June-era ducked volumes resurfacing after reboot).
+        The poll loop compares actual vs expected and corrects drift."""
+        expected = self.cfg.duck_level if self.is_ducked else 1.0
+        try:
+            for si in self._pulse.sink_input_list():
+                node = si.proplist.get("node.name", "")
+                if node not in self.DUCT_NODES:
+                    continue
+                cur = si.volume.values[0] if si.volume.values else None
+                if cur is not None and abs(cur - expected) > 0.02:
+                    v = si.volume
+                    for i in range(len(v.values)):
+                        v.values[i] = expected
+                    self._pulse.sink_input_volume_set(si.index, v)
+                    log.info(f"Re-asserted {node} to {expected:.2f} (was {cur:.2f})")
+        except Exception as e:
+            log.debug(f"duct verify error: {e}")
 
     def _handle_pending(self):
         if self._pending_enable is None:
