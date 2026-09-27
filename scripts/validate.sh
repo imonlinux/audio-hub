@@ -1,8 +1,9 @@
 #!/bin/bash
-# Audio Hub Validation Script
-# Tests the implementation against the validation matrix
+# Audio Hub Validation
+# Run ON the Pi as the hub user (pi), after install + reboot:
+#   bash scripts/validate.sh
 
-set -e
+set -u
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -12,171 +13,196 @@ NC='\033[0m'
 PASS_COUNT=0
 FAIL_COUNT=0
 
-pass() {
-    echo -e "${GREEN}✓${NC} $1"
-    ((PASS_COUNT++))
+pass() { echo -e "${GREEN}✓${NC} $1"; ((PASS_COUNT++)); }
+fail() { echo -e "${RED}✗${NC} $1"; ((FAIL_COUNT++)); }
+warn() { echo -e "${YELLOW}⚠${NC} $1"; }
+
+UNIT_ENV="${AUDIOHUB_CONFIG:-/etc/audiohub/unit.env}"
+
+# --------------------------------------------------------------------------
+user_service_active() {
+    systemctl --user is-active "$1" &>/dev/null
 }
 
-fail() {
-    echo -e "${RED}✗${NC} $1"
-    ((FAIL_COUNT++))
+system_service_active() {
+    systemctl is-active "$1" &>/dev/null
 }
 
-warn() {
-    echo -e "${YELLOW}⚠${NC} $1"
-}
-
-# Check if PipeWire is running
 check_pipewire() {
     echo ""
-    echo "=== PipeWire Status ==="
-    if systemctl --user is-active pipewire.service &>/dev/null; then
-        pass "PipeWire is running"
-    else
-        fail "PipeWire is not running"
-    fi
+    echo "=== PipeWire Stack ==="
+    for svc in pipewire wireplumber pipewire-pulse; do
+        if user_service_active "$svc.service"; then
+            pass "$svc.service running"
+        else
+            fail "$svc.service not running"
+        fi
+    done
 }
 
-# Check for virtual buses
 check_virtual_buses() {
     echo ""
     echo "=== Virtual Buses ==="
+    # wpctl shows descriptions only; pactl shows real node names
     for bus in "bus.tv" "bus.bt" "bus.music"; do
-        if wpctl status | grep -q "$bus"; then
+        if pactl list short sinks 2>/dev/null | grep -q "$bus"; then
             pass "Virtual bus $bus exists"
         else
             fail "Virtual bus $bus not found"
         fi
     done
+    if grep -q "monitor.channel-volumes" "$HOME/.config/pipewire/pipewire.conf.d/20-virtual-buses.conf" 2>/dev/null; then
+        pass "monitor.channel-volumes set on buses (volume audible)"
+    else
+        fail "monitor.channel-volumes missing — bus volume sliders would be silent"
+    fi
 }
 
-# Check for duct loopbacks
 check_ducts() {
     echo ""
-    echo "=== Audio Ducts ==="
-    for duct in "duct.tv" "duct.bt" "duct.music"; do
-        if pw-link -i | grep -q "$duct"; then
-            pass "Duct $duct exists"
-        else
-            fail "Duct $duct not found"
-        fi
-    done
+    echo "=== Ducts (bus -> hardware sink) ==="
+    # pw-link -l prints each port/link on separate lines; every duct
+    # playback port appears twice (own block + hw-sink block) -> 3 ducts x
+    # 2 channels x 2 = 12 lines.
+    local lines
+    lines="$(pw-link -l 2>/dev/null | grep -c 'duct\..*\.playback:output' || true)"
+    if [ "$lines" -eq 12 ]; then
+        pass "All 6 duct channels linked (3 ducts x stereo)"
+    else
+        fail "Expected 12 duct lines in pw-link output, found $lines (graph may still be assembling; retry in 30 s)"
+    fi
 }
 
-# Check for UR23 device
+check_no_feedback() {
+    echo ""
+    echo "=== Feedback Check ==="
+    # The hardware sink's monitor must never be a link SOURCE (that is the
+    # v1 boot feedback loop failure mode).
+    local rogue
+    rogue="$(pw-link -l 2>/dev/null | grep -c 'alsa_output.*:monitor_' || true)"
+    if [ "$rogue" -eq 0 ]; then
+        pass "No links sourcing the hardware-sink monitor"
+    else
+        fail "$rogue link(s) source the hardware-sink monitor — FEEDBACK LOOP RISK"
+    fi
+}
+
 check_ur23() {
     echo ""
-    echo "=== UR23 Device ==="
-    if wpctl status | grep -q "UR23"; then
-        pass "UR23 device detected"
+    echo "=== UR23 (TV Optical) ==="
+    local live_node matches
+    # The config covers both candidate node names (signal vs no-signal);
+    # the live node must be one of them.
+    mapfile -t targets < <(grep -oP 'target.object = "\Kalsa_input[^"]+' \
+        "$HOME/.config/pipewire/pipewire.conf.d/40-loopback-tv.conf" 2>/dev/null)
+    live_node="$(wpctl status 2>/dev/null | grep -oP 'alsa_input\.usb-HiFimeDIY\S+(?=:)' | sort -u | head -1)"
+    if [ -n "$live_node" ]; then
+        pass "UR23 source present: $live_node"
     else
-        fail "UR23 device not found"
+        warn "UR23 source not present (expected while the TV is off / no S/PDIF signal)"
+    fi
+    matches="$(printf '%s\n' "${targets[@]}" | grep -c "^${live_node}\$" || true)"
+    if [ -n "$live_node" ] && [ "$matches" -ge 1 ]; then
+        pass "Live UR23 node is covered by a loopback target"
+    elif [ -n "$live_node" ]; then
+        fail "Live UR23 node '$live_node' matches NO loopback target (${targets[*]}) — update 40-loopback-tv.conf"
     fi
 }
 
-# Check for no stale monitor links
-check_no_stale_links() {
-    echo ""
-    echo "=== Link Cleanliness ==="
-    STALE=$(pw-link -o | grep -c "monitor.*fallback" || true)
-    if [ "$STALE" -eq 0 ]; then
-        pass "No stale monitor↔fallback links"
-    else
-        fail "Found $STALE stale monitor↔fallback links (Issue 1!)"
-    fi
-}
-
-# Check Bluetooth is discoverable
 check_bluetooth() {
     echo ""
     echo "=== Bluetooth ==="
-    if systemctl is-active bluetooth &>/dev/null; then
-        pass "Bluetooth service is running"
+    if system_service_active bluetooth.service; then
+        pass "bluetooth.service running"
     else
-        fail "Bluetooth service is not running"
+        fail "bluetooth.service not running"
     fi
-
-    # Check discoverable timeout is 0
-    if grep -q "DiscoverableTimeout=0" /etc/bluetooth/main.conf; then
-        pass "DiscoverableTimeout = 0 (always discoverable)"
+    if system_service_active bt-agent.service; then
+        pass "bt-agent.service running (auto-accept pairing)"
     else
-        fail "DiscoverableTimeout not set to 0"
+        fail "bt-agent.service not running — pairing will fail"
     fi
-}
-
-# Check WiFi settings
-check_wifi() {
-    echo ""
-    echo "=== WiFi Settings ==="
-    if nmcli connection show "McWiFi" &>/dev/null; then
-        pass "McWiFi connection exists"
-
-        RETRIES=$(nmcli -g connection.autoconnect-retries connection show "McWiFi")
-        if [ "$RETRIES" = "0 (forever)" ] || [ "$RETRIES" = "0" ]; then
-            pass "autoconnect-retries = 0 (infinite)"
-        else
-            fail "autoconnect-retries not set to infinite: $RETRIES"
-        fi
-
-        AUTH_RETRIES=$(nmcli -g auth-retries connection show "McWiFi")
-        if [ "$AUTH_RETRIES" = "0 (forever)" ] || [ "$AUTH_RETRIES" = "0" ]; then
-            pass "auth-retries = 0 (infinite)"
-        else
-            fail "auth-retries not set to infinite: $AUTH_RETRIES"
-        fi
+    if system_service_active bluetooth-setup.service; then
+        pass "bluetooth-setup.service ran (unblock + discoverable)"
     else
-        warn "McWiFi connection not found"
+        fail "bluetooth-setup.service not active"
+    fi
+    if bluetoothctl show 2>/dev/null | grep -q "Audio Sink"; then
+        pass "A2DP Audio Sink UUID registered"
+    else
+        warn "Audio Sink UUID missing — restart bluetooth.service after WirePlumber is up"
     fi
 }
 
-# Check for services
 check_services() {
     echo ""
-    echo "=== Services ==="
-    for service in "pipewire" "wireplumber" "pipewire-pulse"; do
-        if systemctl --user is-active "$service.service" &>/dev/null; then
-            pass "$service.service is running"
-        else
-            fail "$service.service is not running"
-        fi
-    done
-
-    if systemctl --user is-active hubd.service &>/dev/null; then
-        pass "hubd.service is running"
+    echo "=== Hub Services ==="
+    if user_service_active hubd.service; then
+        pass "hubd.service running"
     else
-        warn "hubd.service not running (expected if not yet installed)"
+        fail "hubd.service not running (journalctl --user -u hubd.service)"
+    fi
+    if user_service_active sendspin.service; then
+        pass "sendspin.service running"
+    else
+        warn "sendspin.service not running (needs Music Assistant to connect to be useful)"
+    fi
+    [ -f "$UNIT_ENV" ] && pass "Unit config present ($UNIT_ENV)" || fail "Unit config missing ($UNIT_ENV)"
+    [ -f "$HOME/.config/sendspin/settings-daemon.json" ] \
+        && pass "Sendspin settings present" \
+        || warn "Sendspin settings not yet provisioned (created on first sendspin start)"
+}
+
+check_linger() {
+    echo ""
+    echo "=== Boot Resilience ==="
+    if loginctl show-user "$USER" --property=Linger 2>/dev/null | grep -q yes; then
+        pass "Linger enabled for $USER (services start at boot)"
+    else
+        fail "Linger NOT enabled for $USER — nothing user-level will start after reboot"
     fi
 }
 
-# Print summary
+check_wifi() {
+    echo ""
+    echo "=== WiFi (optional) ==="
+    local conn="${AUDIOHUB_WIFI_CONNECTION:-}"
+    if [ -z "$conn" ]; then
+        warn "AUDIOHUB_WIFI_CONNECTION not set; skipping"
+        return
+    fi
+    if nmcli connection show "$conn" &>/dev/null; then
+        pass "WiFi connection '$conn' present"
+    else
+        warn "WiFi connection '$conn' not found"
+    fi
+}
+
 print_summary() {
     echo ""
     echo "=== Summary ==="
     echo -e "${GREEN}Passed:${NC} $PASS_COUNT"
     echo -e "${RED}Failed:${NC} $FAIL_COUNT"
-
-    if [ $FAIL_COUNT -eq 0 ]; then
-        echo -e "\n${GREEN}All checks passed!${NC}"
+    if [ "$FAIL_COUNT" -eq 0 ]; then
+        echo -e "\n${GREEN}All checks passed.${NC}"
         exit 0
-    else
-        echo -e "\n${RED}Some checks failed.${NC}"
-        exit 1
     fi
+    echo -e "\n${RED}Some checks failed.${NC}"
+    exit 1
 }
 
-# Main
 main() {
     echo "Audio Hub Validation"
     echo "===================="
-
     check_pipewire
     check_virtual_buses
     check_ducts
+    check_no_feedback
     check_ur23
-    check_no_stale_links
     check_bluetooth
-    check_wifi
     check_services
+    check_linger
+    check_wifi
     print_summary
 }
 

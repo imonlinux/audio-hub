@@ -1,32 +1,33 @@
-# Audio Hub Required Packages
-# Raspberry Pi OS 64-bit (Debian Trixie)
-# Generated from: dpkg -l | grep -E "pipewire|wireplumber|bluez|python3"
+# Audio Hub required packages (Debian / Raspberry Pi OS Trixie, aarch64)
+#
+# Unversioned on purpose: pins (pkg=ver) break installs as soon as a repo
+# updates. Reference build was pipewire 1.4.2 / wireplumber 0.5.8 /
+# bluez 5.82 — anything >= these from the Trixie repos is expected to work.
 
-# Audio Stack (Pinned versions from tested build)
-pipewire:arm64=1.4.2-1+rpt3
-pipewire-audio:arm64=1.4.2-1+rpt3
-pipewire-alsa:arm64=1.4.2-1+rpt3
-pipewire-bin:arm64=1.4.2-1+rpt3
-pipewire-pulse:arm64=1.4.2-1+rpt3
-libpipewire-0.3-0:arm64=1.4.2-1+rpt3
-libpipewire-0.3-common=1.4.2-1+rpt3
-wireplumber:arm64=0.5.8-2
-libwireplumber-0.5-0:arm64=0.5.8-2
+# Audio stack
+pipewire
+pipewire-audio
+pipewire-alsa
+pipewire-pulse
+pipewire-bin
+wireplumber
+libspa-0.2-bluetooth
+pulseaudio-utils
 
 # Bluetooth
-bluez:arm64=5.82-1.1+rpt1
-bluez-firmware=1.2-13+rpt2
-bluez-obexd:arm64=5.82-1.1+rpt1
-bluez-tools=2.0~20170911.0.7cb788c-4+b2
-libspa-0.2-bluetooth:arm64=1.4.2-1+rpt3
+bluez
+bluez-firmware
+bluez-obexd
+bluez-tools   # also provides /usr/bin/bt-agent (there is no separate bt-agent package)
+rfkill
 
-# Python Dependencies
+# Python dependencies for hubd (system packages, no venv needed)
 python3-evdev
 python3-paho-mqtt
 python3-pulsectl
 
-# Network
+# Network / system
 network-manager
-
-# System
-argonone-fan
+iw
+usbutils
+curl

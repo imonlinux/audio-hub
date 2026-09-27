@@ -1,26 +1,25 @@
 [Unit]
 Description=Sendspin Music Assistant Client
-Documentation=https://github.com/TheRealLurpp/sendspin
 After=pipewire.service wireplumber.service pipewire-pulse.service
 Wants=pipewire.service wireplumber.service pipewire-pulse.service
-PartOf=pipewire.service
 
 [Service]
 Type=simple
-# Set stable application name for routing and detection
+Environment=PYTHONUNBUFFERED=1
+# Route Sendspin's audio stream to the music bus by stable node name.
+# PIPEWIRE_NODE is honored by the PipeWire ALSA plugin (PIPEWIRE_ALSA_SINK
+# does not exist). The application.name props are a no-op for ALSA streams
+# but cost nothing if the backend ever changes to the Pulse protocol.
+Environment=PIPEWIRE_NODE=bus.music
 Environment=PULSE_PROP_application.name=sendspin
 Environment=PULSE_PROP_media.name=sendspin
-# Route to bus.music by stable name
-Environment=PULSE_SINK=bus.music
-Environment=PIPEWIRE_ALSA_SINK=bus.music
-Environment=PIPEWIRE_NODE=bus.music
-# Sendspin-specific settings from unit config
-Environment=SENDSPIIN_PLAYER_NAME=${AUDIOHUB_PLAYER_NAME:-Living Room}
-Environment=PYTHONUNBUFFERED=1
-
-ExecStart=/home/pi/.local/bin/sendspin daemon
+# Syncs identity (name/client_id) from /etc/audiohub/unit.env and detects
+# the PipeWire ALSA PCM index for this boot (USB enumeration is unstable).
+# Exits nonzero when detection fails, so systemd retries via Restart=always.
+ExecStartPre=%h/.local/bin/sendspin-detect-device.sh
+ExecStart=%h/.local/bin/sendspin daemon
 Restart=always
-RestartSec=3
+RestartSec=5
 
 # Security hardening
 NoNewPrivileges=true

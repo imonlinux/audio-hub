@@ -1,0 +1,15 @@
+[Unit]
+Description=Audio Hub Bluetooth adapter setup (unblock, power, discoverable)
+After=bluetooth.service
+Wants=bluetooth.service
+
+[Service]
+Type=oneshot
+# rfkill soft-blocks persist across reboots and BlueZ does not restore
+# discoverable/pairable state, so guest pairing would silently fail after
+# every reboot without this.
+ExecStart=/usr/local/sbin/bluetooth-setup.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
