@@ -10,7 +10,7 @@ A self-contained audio hub for Raspberry Pi 4B: mixes three sources (TV optical,
 2. **Stable names only** — routing attaches to `node.name`s (`bus.*`, `duct.*`), never numeric IDs.
 3. **Single source of truth** — `/etc/audiohub/unit.env` drives hubd, Sendspin identity, and Bluetooth naming.
 4. **Minimum services** — only `hubd` + `sendspin` (user units) and `bt-agent` + `bluetooth-setup` + `wifi-powersave-off` (system units).
-5. **Reproducible** — git repo + idempotent installer.
+5. **Reproducible** — checksum-verified tagged releases, idempotent installer, weekly self-updates.
 
 ## Architecture
 
@@ -27,24 +27,67 @@ Sendspin ──PIPEWIRE_NODE──▶ [bus.music] ──duct.music──▶
 
 hubd (single daemon) does ducking (poll, 0.5 s), MQTT/Home Assistant entities, and FLIRC IR volume/mute.
 
-## Install
+## Deploy a new unit
+
+Everything except the physical work (flashing, cabling) is one command on the Pi.
+
+1. **Flash the SD card** with Raspberry Pi Imager: **Raspberry Pi OS Lite (64-bit)**, and in the OS customization set hostname, user, SSH key, and WiFi. Any username works — the installer picks the hub user automatically (`pi` if present, else the first regular user).
+2. **Boot the Pi, SSH in**, and run the bootstrap (inspect it first if you like — that's the point of the two steps):
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/imonlinux/audio-hub/main/bootstrap.sh -o bootstrap.sh
+   sudo bash bootstrap.sh
+   ```
+
+   The bootstrap resolves the current **stable** release, verifies its sha256 checksum against the release asset, installs the tree to `/opt/audio-hub`, and runs the installer. Overrides: `sudo AUDIOHUB_USER=<name> bash bootstrap.sh` (hub user) or `sudo AUDIOHUB_RELEASE=v1.2.3 bash bootstrap.sh` (pin a release).
+
+3. **Edit the unit config** — MQTT credentials are per-unit; identity is pre-seeded from the hostname:
+
+   ```bash
+   sudo nano /etc/audiohub/unit.env
+   ```
+
+4. **Reboot**, then verify as the hub user:
+
+   ```bash
+   bash /opt/audio-hub/scripts/validate.sh
+   ```
+
+The installer is idempotent and preserves `/etc/audiohub/unit.env`, so re-running the bootstrap is always safe.
+
+**Migrating an existing git-clone unit** (the two pre-fleet deployments): `git pull` once to get this tooling, run `sudo ./install.sh`, then run `sudo bash bootstrap.sh` — the tree moves to `/opt/audio-hub` and the unit switches to release updates. The repo copy in the home directory can be removed afterwards.
+
+## Updating
+
+Each unit runs `audiohub-update` weekly (Sunday 04:30 + up to an hour of jitter, catch-up after downtime). Updates are release-tarball based and checksum-verified; after installing, the updater restarts PipeWire and the hub services — no reboot needed (set `AUDIOHUB_UPDATE_REBOOT=true` in `unit.env` to reboot instead).
 
 ```bash
-# On the Pi, as root:
-sudo ./install.sh
-
-# Edit the unit config (MQTT credentials + device identity):
-sudo nano /etc/audiohub/unit.env
-
-# Reboot to load all configs
-sudo reboot
+sudo audiohub-update --check   # resolve the channel, compare, change nothing
+sudo audiohub-update           # apply now
+sudo audiohub-update --force   # re-apply even if current (repair)
 ```
 
-The installer runs everything user-level as the `pi` user (override with `AUDIOHUB_USER=<name> audiohub`) and enables linger so the stack starts at boot with no login. It also installs Sendspin (`uv tool install sendspin` into the user's home).
+Channels and per-unit settings live in `unit.env`:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `AUDIOHUB_AUTO_UPDATE` | `true` | `false` makes the weekly timer a no-op (manual runs still work) |
+| `AUDIOHUB_RELEASE_CHANNEL` | `stable` | `stable` = promoted releases; `canary` = includes pre-releases |
+| `AUDIOHUB_RELEASE` | unset | Pin an exact tag — overrides the channel, and doubles as rollback |
+| `AUDIOHUB_UPDATE_REBOOT` | `false` | Reboot after a successful update instead of restarting services |
+
+**Rollback**: set `AUDIOHUB_RELEASE=v1.2.2` in `unit.env` and run `sudo audiohub-update`. Scheduled updates are forward-only — a channel resolving to something older than the deployed version is skipped.
+
+## Cutting a release (maintainer)
+
+1. Tag and push: `git tag v1.2.3 && git push origin v1.2.3`. CI attaches `sha256sums.txt` (of the exact archives devices download) and publishes the release as a **pre-release** — that is the **canary** channel.
+2. Point a soak unit at it: set `AUDIOHUB_RELEASE_CHANNEL=canary` there (the maintainer's own unit(s)); it updates at the next weekly check, or run `sudo audiohub-update` directly.
+3. After soak, promote: edit the release on GitHub and untick **Set as a pre-release**. It is now the **stable** release; all stable units pick it up within a week.
+4. `sendspin` is version-pinned in `unit.env.example` (`AUDIOHUB_SENDSPIN_VERSION`) — bump the pin only after re-verifying the ducking hooks on hardware.
 
 ## Configuration
 
-`/etc/audiohub/unit.env` — see `unit.env.example` for all fields. Device identity, MQTT, ducking, and IR are all set there.
+`/etc/audiohub/unit.env` — see `unit.env.example` for all fields. Device identity, MQTT, ducking, IR, and release-update behavior are all set there.
 
 ## Services
 
@@ -56,11 +99,13 @@ The installer runs everything user-level as the `pi` user (override with `AUDIOH
 | `bt-agent.service` | system | auto-accept Bluetooth pairing |
 | `bluetooth-setup.service` | system | rfkill unblock + discoverable/pairable at boot |
 | `wifi-powersave-off.service` | system | WiFi power save off |
+| `audiohub-update.timer` → `.service` | system | weekly checksum-verified release check |
 
 ## Directory Structure
 
 ```
 audio-hub/
+├── bootstrap.sh            # One-command provisioning (curl | sudo bash)
 ├── install.sh              # Idempotent installer (run as root)
 ├── packages.txt            # apt packages (comments allowed)
 ├── unit.env.example        # Per-unit config template -> /etc/audiohub/unit.env
@@ -70,23 +115,31 @@ audio-hub/
 │   └── bluetooth/          # /etc/bluetooth/main.conf
 ├── systemd/
 │   ├── user/               # hubd.service, sendspin.service
-│   └── system/             # bt-agent, bluetooth-setup, wifi-powersave-off
+│   └── system/             # bt-agent, bluetooth-setup, wifi-powersave-off,
+│                           #   audiohub-update.{service,timer}
+├── .github/workflows/      # release.yml: tag -> pre-release + sha256sums
 ├── hubd/                   # Hub controller daemon (ducking + MQTT + IR)
 └── scripts/
     ├── validate.sh         # Post-boot validation (run as the hub user)
+    ├── audiohub-update     # Release updater (installed to /usr/local/sbin)
     ├── bluetooth-setup.sh  # Boot adapter bring-up (installed to /usr/local/sbin)
-    └── sendspin-detect-device.sh  # settings-daemon.json sync + device index detect
+    ├── sendspin-detect-device.sh  # settings-daemon.json identity sync
+    └── audiohub-music-hook # Sendspin start/stop hook (ducking flag)
 ```
+
+Deployed units keep the tree at `/opt/audio-hub` (root-owned, swapped atomically by the updater); development checkouts run the installer straight from the repo.
 
 ## Verification
 
 After a reboot, as the hub user:
 
 ```bash
-bash scripts/validate.sh
+bash /opt/audio-hub/scripts/validate.sh   # (repo path on dev checkouts)
 systemctl --user status hubd.service sendspin.service
 journalctl --user -u hubd.service -f
 ```
+
+`validate.sh` also reports the deployed version (`/etc/audiohub/version`) and the state of the release-update timer.
 
 ### Verified on hardware (living-room-media)
 

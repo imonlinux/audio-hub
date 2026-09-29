@@ -196,6 +196,37 @@ check_wifi() {
     fi
 }
 
+check_updates() {
+    echo ""
+    echo "=== Release Updates ==="
+    local version auto
+    if [ -r /etc/audiohub/version ]; then
+        version="$(cat /etc/audiohub/version)"
+        pass "Deployed version stamped: $version"
+    else
+        warn "No version stamp at /etc/audiohub/version (development checkout?)"
+    fi
+    auto="$(grep -E '^AUDIOHUB_AUTO_UPDATE=' "$UNIT_ENV" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')"
+    auto="${auto:-true}"
+    if [ "$auto" != "true" ]; then
+        warn "Scheduled self-updates disabled (AUDIOHUB_AUTO_UPDATE=$auto)"
+        return 0
+    fi
+    if systemctl is-active audiohub-update.timer &>/dev/null; then
+        pass "audiohub-update.timer active (weekly release check)"
+    else
+        fail "AUDIOHUB_AUTO_UPDATE=$auto but audiohub-update.timer is not active — run the installer"
+    fi
+    if [ -x /usr/local/sbin/audiohub-update ]; then
+        pass "audiohub-update present (/usr/local/sbin)"
+    else
+        fail "audiohub-update missing — re-run the installer"
+    fi
+    if grep -q "your_password_here" "$UNIT_ENV" 2>/dev/null; then
+        fail "unit.env still has the placeholder MQTT password — set real credentials"
+    fi
+}
+
 print_summary() {
     echo ""
     echo "=== Summary ==="
@@ -219,10 +250,11 @@ main() {
     check_ur23
     check_bluetooth
     check_no_second_stack
-    check_services
-    check_linger
-    check_wifi
-    print_summary
+	check_services
+	check_linger
+	check_wifi
+	check_updates
+	print_summary
 }
 
 main
