@@ -1,0 +1,324 @@
+#!/bin/bash
+# audiohub-update — release updater for deployed Audio Hub units.
+#
+# Installed to /usr/local/sbin/audiohub-update by install.sh and driven by
+# audiohub-update.timer (weekly, Sun 04:30 + random hour). Also safe to run
+# by hand:
+#   sudo audiohub-update            # apply the channel's release if newer
+#   sudo audiohub-update --check    # resolve + compare only, change nothing
+#   sudo audiohub-update --force    # re-apply even if not newer (repair)
+#
+# Channel and pin come from /etc/audiohub/unit.env:
+#   AUDIOHUB_AUTO_UPDATE=true|false    timer honors this; manual runs always run
+#   AUDIOHUB_RELEASE_CHANNEL=stable    stable (promoted) | canary (pre-releases)
+#   AUDIOHUB_RELEASE=v1.0.2            explicit pin; overrides the channel
+#   AUDIOHUB_UPDATE_REBOOT=false       true reboots after a successful update
+#
+# Updates are forward-only in scheduled mode: a pin or channel that resolves
+# OLDER than the deployed version is skipped (pin + manual run = rollback).
+# The previous tree is kept at /opt/audio-hub.old until the next update.
+
+set -euo pipefail
+
+GH_REPO="imonlinux/audio-hub"
+API_REPO="https://api.github.com/repos/${GH_REPO}"
+TARBALL_BASE="https://github.com/${GH_REPO}/archive"
+INSTALL_ROOT="/opt/audio-hub"
+UNIT_ENV="${AUDIOHUB_CONFIG:-/etc/audiohub/unit.env}"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+log_info() { echo -e "${GREEN}[INFO]${NC} $1" >&2; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $1" >&2; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
+
+MODE="manual"   # manual | scheduled | check | force
+WORK=""         # download staging dir; EXIT trap cleans it (global on purpose)
+
+# ---------------------------------------------------------------------------
+# HTTP + release resolution (identical logic to bootstrap.sh — this script
+# must never depend on the tree it is about to replace)
+# ---------------------------------------------------------------------------
+
+http_get() { # http_get <url> <outfile>
+    if command -v curl &>/dev/null; then
+        curl -fsSL "$1" -o "$2"
+    else
+        wget -qO "$2" "$1"
+    fi
+}
+
+# GitHub API GET; prints the response with the HTTP code appended as the
+# last line (000 = could not connect). curl is guaranteed present
+# (installed by bootstrap, and in packages.txt).
+api_get() { # api_get <path>
+    curl -sS -w '\n%{http_code}' "$API_REPO$1" 2>/dev/null || printf '\n000'
+}
+
+# Split api_get output: sets API_CODE and API_BODY
+api_split() {
+    API_CODE="${1##*$'\n'}"
+    API_BODY="${1%$'\n'*}"
+}
+
+json_tag() {
+    sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
+}
+
+resolve_release() { # resolve_release <stable|canary> -> tag on stdout
+    local channel="$1" out tag
+    case "$channel" in
+        canary)
+            out="$(api_get "/releases?per_page=1")"; api_split "$out"
+            if [ "$API_CODE" != "200" ]; then
+                log_error "Cannot resolve channel '$channel' (GitHub API HTTP $API_CODE)"
+                return 1
+            fi
+            tag="$(json_tag <<<"$API_BODY")"
+            ;;
+        stable)
+            out="$(api_get /releases/latest)"; api_split "$out"
+            case "$API_CODE" in
+                200)
+                    tag="$(json_tag <<<"$API_BODY")"
+                    ;;
+                404)
+                    # Nothing promoted yet — every release is still a pre-release
+                    out="$(api_get "/releases?per_page=1")"; api_split "$out"
+                    if [ "$API_CODE" != "200" ]; then
+                        log_error "Cannot resolve channel '$channel' (GitHub API HTTP $API_CODE)"
+                        return 1
+                    fi
+                    tag="$(json_tag <<<"$API_BODY")"
+                    ;;
+                *)
+                    log_error "Cannot resolve channel '$channel' (GitHub API HTTP $API_CODE)"
+                    return 1
+                    ;;
+            esac
+            ;;
+        *)
+            log_error "Unknown release channel '$channel' (expected stable or canary)"
+            return 1
+            ;;
+    esac
+    [ -n "$tag" ] && echo "$tag"
+}
+
+fetch_and_verify() { # fetch_and_verify <tag> <workdir> -> extracted tree
+    local tag="$1" work="$2"
+    local tgz="audio-hub-${tag}.tar.gz"
+    local url_tgz="${TARBALL_BASE}/refs/tags/${tag}.tar.gz"
+    local url_sha="https://github.com/${GH_REPO}/releases/download/${tag}/sha256sums.txt"
+
+    log_info "Downloading release $tag ..."
+    http_get "$url_tgz" "$work/$tgz"
+    if ! http_get "$url_sha" "$work/sha256sums.txt"; then
+        log_error "Release $tag has no sha256sums.txt asset — refusing unverified update"
+        return 1
+    fi
+    (cd "$work" && grep -E "[[:space:]]${tgz}\$" sha256sums.txt | sha256sum --check --status -) || {
+        log_error "Checksum verification FAILED for release $tag — aborting"
+        return 1
+    }
+    log_info "Checksum OK"
+
+    mkdir -p "$work/tree"
+    tar -xzf "$work/$tgz" -C "$work/tree" --strip-components=1
+    echo "$work/tree"
+}
+
+# ---------------------------------------------------------------------------
+# Unit config + helpers
+# ---------------------------------------------------------------------------
+
+env_value() { # env_value <KEY> -> value (last assignment wins, quotes stripped)
+    [ -r "$UNIT_ENV" ] || return 0
+    grep -E "^${1}=" "$UNIT_ENV" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' || true
+}
+
+hub_user() {
+    local u
+    u="$(env_value AUDIOHUB_USER)"
+    if [ -z "$u" ]; then
+        if id pi &>/dev/null; then u="pi"; else
+            u="$(awk -F: '$3 >= 1000 && $1 != "nobody" && $6 != "" && $7 !~ /(false|nologin)$/ { print $1; exit }' /etc/passwd)"
+        fi
+    fi
+    echo "$u"
+}
+
+as_hub() { # as_hub <cmd...> — run as the hub user with its runtime env
+    local u="$1"; shift
+    local uid home
+    uid="$(id -u "$u")"
+    home="$(getent passwd "$u" | cut -d: -f6)"
+    sudo -u "$u" -H env "XDG_RUNTIME_DIR=/run/user/$uid" "HOME=$home" "$@"
+}
+
+is_semver_tag() { [[ "$1" =~ ^v[0-9]+(\.[0-9]+){1,3}$ ]]; }
+
+# true when tag $1 is older than tag $2
+tag_older() {
+    local a="${1#v}" b="${2#v}"
+    [ "$(printf '%s\n%s\n' "$a" "$b" | sort -V | head -1)" = "$a" ] && [ "$a" != "$b" ]
+}
+
+deployed_version() {
+    if [ -r /etc/audiohub/version ]; then
+        cat /etc/audiohub/version
+    else
+        echo "none"
+    fi
+}
+
+restart_services() { # restart_services <hub-user>
+    local u="$1"
+    if [ ! -d "/run/user/$(id -u "$u")" ]; then
+        log_warn "User manager for $u not running; services will start at next boot"
+        return 0
+    fi
+    log_info "Restarting the user audio stack and hub services ..."
+    as_hub "$u" systemctl --user restart pipewire-pulse.service pipewire.service wireplumber.service || true
+    sleep 3
+    as_hub "$u" systemctl --user restart hubd.service sendspin.service || true
+    log_info "Services restarted"
+}
+
+rollback() { # rollback <hub-user>
+    log_error "Update failed — rolling back to the previous tree"
+    if [ -d "$INSTALL_ROOT.old" ]; then
+        rm -rf "$INSTALL_ROOT"
+        mv "$INSTALL_ROOT.old" "$INSTALL_ROOT"
+        (cd "$INSTALL_ROOT" && AUDIOHUB_USER="$1" bash install.sh) || {
+            log_error "Rollback installer run FAILED — inspect the unit manually"
+            return 1
+        }
+        local tag
+        tag="$(cat "$INSTALL_ROOT/.release-tag" 2>/dev/null || true)"
+        [ -n "$tag" ] && echo "$tag" > /etc/audiohub/version
+        restart_services "$1"
+        log_warn "Rollback complete; the deployed tree is the previous release again"
+    else
+        log_error "No previous tree kept at $INSTALL_ROOT.old — inspect the unit manually"
+    fi
+}
+
+usage() {
+    sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# ---------------------------------------------------------------------------
+
+main() {
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --check) MODE="check" ;;
+            --force) MODE="force" ;;
+            --scheduled) MODE="scheduled" ;;
+            -h|--help) usage; exit 0 ;;
+            *) log_error "Unknown option: $arg"; usage; exit 2 ;;
+        esac
+    done
+
+    if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+        log_error "audiohub-update must run as root: sudo audiohub-update"
+        exit 1
+    fi
+
+    # Timer runs use --scheduled; units with auto-update disabled just exit
+    if [ "$MODE" = "scheduled" ]; then
+        local auto
+        auto="$(env_value AUDIOHUB_AUTO_UPDATE)"
+        auto="${auto:-true}"
+        if [ "$auto" != "true" ]; then
+            echo "audiohub-update: auto-updates disabled (AUDIOHUB_AUTO_UPDATE=$auto); skipping"
+            exit 0
+        fi
+    fi
+
+    [ -d "$INSTALL_ROOT" ] || {
+        log_error "$INSTALL_ROOT does not exist — deploy with bootstrap.sh first"
+        exit 1
+    }
+
+    local user pin channel target current
+    user="$(hub_user)"
+    if [ -z "$user" ] || ! id "$user" &>/dev/null; then
+        log_error "Cannot determine the hub user — set AUDIOHUB_USER in $UNIT_ENV"
+        exit 1
+    fi
+
+    pin="$(env_value AUDIOHUB_RELEASE)"
+    if [ -n "$pin" ]; then
+        target="$pin"
+        log_info "Release pinned via AUDIOHUB_RELEASE: $target"
+    else
+        channel="$(env_value AUDIOHUB_RELEASE_CHANNEL)"
+        channel="${channel:-stable}"
+        if ! target="$(resolve_release "$channel")"; then
+            log_error "Cannot resolve channel '$channel' (GitHub API unreachable or no releases)"
+            exit 1
+        fi
+    fi
+
+    current="$(deployed_version)"
+    if [ "$target" = "$current" ] && [ "$MODE" != "force" ]; then
+        echo "audiohub-update: already on $target"
+        exit 0
+    fi
+
+    # Scheduled updates are forward-only; rollback is an explicit act
+    if [ "$MODE" = "scheduled" ] && is_semver_tag "$target" && is_semver_tag "$current" \
+        && tag_older "$target" "$current"; then
+        log_warn "Resolved release $target is older than deployed $current; skipping (forward-only)"
+        exit 0
+    fi
+
+    if [ "$MODE" = "check" ]; then
+        echo "audiohub-update: deployed $current, channel/pin resolves to $target"
+        [ "$target" = "$current" ] && exit 0
+        exit 3
+    fi
+
+    local tree
+    WORK="$(mktemp -d)"
+    trap 'rm -rf "$WORK"' EXIT
+    tree="$(fetch_and_verify "$target" "$WORK")"
+
+    log_info "Installing release $target (currently $current) ..."
+    rm -rf "$INSTALL_ROOT.old"
+    if [ -d "$INSTALL_ROOT" ]; then
+        mv "$INSTALL_ROOT" "$INSTALL_ROOT.old"
+    fi
+    mv "$tree" "$INSTALL_ROOT"
+    chmod 755 "$INSTALL_ROOT"
+    echo "$target" > "$INSTALL_ROOT/.release-tag"
+
+    if (cd "$INSTALL_ROOT" && AUDIOHUB_USER="$user" bash install.sh); then
+        echo "$target" > /etc/audiohub/version
+    else
+        rollback "$user"
+        exit 1
+    fi
+
+    restart_services "$user"
+
+    local reboot
+    reboot="$(env_value AUDIOHUB_UPDATE_REBOOT)"
+    if [ "${reboot:-false}" = "true" ]; then
+        log_info "AUDIOHUB_UPDATE_REBOOT=true — rebooting"
+        sync
+        systemctl reboot
+    else
+        log_info "Update to $target complete. A reboot is recommended at the next convenient time."
+    fi
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
+fi
