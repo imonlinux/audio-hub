@@ -153,6 +153,135 @@ class HubConfig:
 
 
 # -----------------------------------------------------------------------------
+# Device Selection (runtime output / TV-source routing)
+# -----------------------------------------------------------------------------
+# ALSA node names carry a trailing profile component that is not stable
+# (...analog-stereo vs ...stereo-fallback on the UR23, profile transitions on
+# built-in outputs). Selections therefore use the STABLE PREFIX: the node name
+# with the final dot-component stripped. Applying a selection resolves the
+# prefix against the live nodes; exact match first, then the longest live node.
+
+TV_CAPTURE_NODES = ("loopback.tv.capture", "loopback.tv2.capture")
+DUCT_PLAYBACK_NODES = ("duct.tv.playback", "duct.bt.playback", "duct.music.playback")
+
+
+def node_prefix(node_name: str) -> str:
+    """Stable selection key: node name minus the trailing profile component.
+    A name with no room for a profile (fewer than three dot-components) is
+    returned unchanged rather than mangled."""
+    head, sep, tail = node_name.rpartition(".")
+    return head if sep and "." in head else node_name
+
+
+def hardware_output_names(sink_names: list) -> list:
+    """Hardware sinks selectable as the unit output. Excludes the virtual
+    buses (no alsa_ prefix), PipeWire's auto_null placeholder, and BT
+    speakers (ducking semantics and the single-stack guarantee are designed
+    around wired output; revisit if a use case appears)."""
+    return sorted(
+        n for n in sink_names
+        if n.startswith("alsa_output.")
+        and not n.startswith("auto_null.")
+        and not n.startswith("bluez_sink.")
+    )
+
+
+def hardware_capture_names(source_names: list) -> list:
+    """Hardware capture nodes selectable as the TV source. All hardware
+    captures are listed (S/PDIF-capability filtering would add device-model
+    coupling for no real-world unit); any sink monitor is excluded."""
+    return sorted(
+        n for n in source_names
+        if n.startswith("alsa_input.")
+        and not n.endswith(".monitor")
+    )
+
+
+def build_options(node_names: list) -> list:
+    """Selection options from live node names: stable prefixes, except a
+    prefix shared by multiple live nodes (two identical dongles) falls back
+    to full node names so two devices are never silently merged."""
+    by_prefix: dict = {}
+    for n in node_names:
+        by_prefix.setdefault(node_prefix(n), []).append(n)
+    options = []
+    for prefix, names in sorted(by_prefix.items()):
+        if len(names) == 1:
+            options.append(prefix)
+        else:
+            options.extend(sorted(names))
+    return sorted(options)
+
+
+def resolve_option(option: str, node_names: list) -> "str | None":
+    """Resolve a selection option to a live node name: exact match first,
+    else the longest live node carrying the option as a prefix."""
+    if option in node_names:
+        return option
+    matches = [n for n in node_names if n.startswith(option + ".")]
+    if not matches:
+        return None
+    return max(matches, key=len)
+
+
+class SelectionStore:
+    """Desired output / TV-source selection, persisted to
+    ~/.config/audiohub/selection.json (hubd runs unprivileged; /etc/audiohub
+    stays root-owned). Values are selection options (stable prefixes, or full
+    node names in the duplicate-device case) or None = factory default from
+    unit.env. Thread-safe: shared between the asyncio loop (commands,
+    reconciler) and the ducking thread (TV probe)."""
+
+    KEYS = ("output", "tv_source")
+
+    def __init__(self, path: "str | None" = None):
+        self.path = path or os.path.expanduser(
+            os.path.join("~", ".config", "audiohub", "selection.json"))
+        self._lock = threading.Lock()
+        self._desired: dict = {k: None for k in self.KEYS}
+        self._load()
+
+    def _load(self):
+        try:
+            with open(self.path) as f:
+                data = json.load(f)
+            for k in self.KEYS:
+                v = data.get(k)
+                if isinstance(v, str) and v:
+                    self._desired[k] = v
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            log.warning(f"Ignoring unreadable selection store {self.path}: {e}")
+
+    def get(self, key: str) -> "str | None":
+        with self._lock:
+            return self._desired.get(key)
+
+    def set(self, key: str, option: str):
+        with self._lock:
+            self._desired[key] = option
+            snapshot = dict(self._desired)
+        self._persist(snapshot)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return dict(self._desired)
+
+    def _persist(self, snapshot: dict):
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(snapshot, f, indent=2)
+            os.replace(tmp, self.path)
+        except Exception as e:
+            # Selection stays effective for this session; the store is
+            # re-created on the next accepted command.
+            log.warning(f"Could not persist selection store: {e}")
+
+
+# -----------------------------------------------------------------------------
 # Ducking Engine
 # -----------------------------------------------------------------------------
 class DuckingEngine:
@@ -185,10 +314,13 @@ class DuckingEngine:
     # sink — these (and only these) are attenuated when ducking.
     DUCT_NODES = ("duct.tv.playback", "duct.bt.playback")
 
-    def __init__(self, config: HubConfig, loop: asyncio.AbstractEventLoop, stop_event: threading.Event):
+    def __init__(self, config: HubConfig, loop: asyncio.AbstractEventLoop,
+                 stop_event: threading.Event,
+                 selection: "SelectionStore | None" = None):
         self.cfg = config
         self.loop = loop
         self.stop_event = stop_event
+        self.selection = selection
         self.ducking_enabled = config.ducking_enabled
         self.is_ducked = False
         self._pending_enable: bool | None = None
@@ -387,17 +519,27 @@ class DuckingEngine:
         return self._tv_cached
 
     def _probe_tv_level(self) -> bool:
-        """Record ~0.3 s of raw samples from the UR23 and measure RMS.
+        """Record ~0.3 s of raw samples from the TV source and measure RMS.
         pw-record has no duration option, so use --raw on stdout with a
         short timeout: on SIGKILL the already-flushed bytes are still
         delivered via TimeoutExpired.stdout — enough for an RMS reading."""
         try:
-            pat = self.cfg.tv_source_pattern.lower()
+            # Probe target follows the user's TV Source selection (same rule
+            # as master volume tracking the selected output); the unit.env
+            # pattern is the factory default used when none is in effect.
             target = None
-            for s in self._pulse.source_list():
-                if pat in (s.name or "").lower() or pat in (s.description or "").lower():
-                    target = s.name
-                    break
+            if self.selection is not None:
+                desired = self.selection.get("tv_source")
+                if desired:
+                    captures = hardware_capture_names(
+                        [s.name for s in self._pulse.source_list()])
+                    target = resolve_option(desired, captures)
+            if target is None:
+                pat = self.cfg.tv_source_pattern.lower()
+                for s in self._pulse.source_list():
+                    if pat in (s.name or "").lower() or pat in (s.description or "").lower():
+                        target = s.name
+                        break
             if target is None:
                 return False
             data = b""
@@ -533,7 +675,11 @@ class MQTTBridge:
         self._volume_callbacks: dict[str, object] = {}
         self._mute_callback = None
         self._ducking_callback = None
+        self._selection_callback = None
         self._state_provider = None
+        self._selection_provider = None
+        # Last known select options; updated by publish_selection_discovery.
+        self._selection_options: dict = {"output": [], "tv_source": []}
 
     def on_volume_command(self, source: str, callback):
         """Register callback(level: float) for a source or 'master'."""
@@ -547,10 +693,19 @@ class MQTTBridge:
         """Register callback(enabled: bool)."""
         self._ducking_callback = callback
 
+    def on_selection_command(self, callback):
+        """Register callback(key: 'output'|'tv_source', option: str)."""
+        self._selection_callback = callback
+
     def attach_state_provider(self, provider):
         """Register fn() -> dict with current state, published on connect.
         Called on the asyncio loop (see _publish_initial_state)."""
         self._state_provider = provider
+
+    def attach_selection_provider(self, provider):
+        """Register fn() -> {"options": {...}, "effective": {...}} for the
+        device-selection entities, gathered on the asyncio loop at connect."""
+        self._selection_provider = provider
 
     def _availability_topic(self) -> str:
         return f"{self.cfg.mqtt_base_topic}/sensor/{self.cfg.device_id}_availability/state"
@@ -619,6 +774,8 @@ class MQTTBridge:
             client.subscribe(f"{self.cfg.device_id}/{source}/volume/set")
         client.subscribe(f"{self.cfg.device_id}/mute/set")
         client.subscribe(f"{self.cfg.device_id}/ducking/set")
+        client.subscribe(f"{self.cfg.device_id}/output/set")
+        client.subscribe(f"{self.cfg.device_id}/tv_source/set")
 
         client.publish(self._availability_topic(), "online", retain=True)
         self._publish_discovery(client)
@@ -670,6 +827,8 @@ class MQTTBridge:
                 elif cmd == "ducking" and self._ducking_callback is not None:
                     on = payload.upper() in ("ON", "1", "TRUE", "YES")
                     self._emit(lambda: self._ducking_callback(on))
+                elif cmd in ("output", "tv_source") and self._selection_callback is not None:
+                    self._emit(lambda: self._selection_callback(cmd, payload))
                 else:
                     log.debug(f"Unhandled MQTT command: {topic}")
             else:
@@ -776,10 +935,59 @@ class MQTTBridge:
                 "device": device,
             })
 
+        entities.extend(self._selection_discovery(base, dev_id, availability, device))
+
         for topic, payload in entities:
             client.publish(topic, json.dumps(payload), retain=True)
 
         log.info(f"Published {len(entities)} discovery entities")
+
+    def _selection_discovery(self, base: str, dev_id: str, availability: str,
+                             device: dict) -> list:
+        """HA select payloads for the device-selection entities. Options are
+        the last known live device set (re-published by the reconciler
+        whenever it changes)."""
+        entities = []
+        for key, name, icon in (
+            ("output", "Output Device", "mdi:speaker"),
+            ("tv_source", "TV Source", "mdi:television"),
+        ):
+            entities.append((
+                f"{base}/select/{dev_id}_{key}/config",
+                {
+                    "name": name,
+                    "unique_id": f"{dev_id}_{key}",
+                    "state_topic": f"{dev_id}/{key}/state",
+                    "command_topic": f"{dev_id}/{key}/set",
+                    "options": self._selection_options.get(key, []),
+                    "availability_topic": availability,
+                    "icon": icon,
+                    "device": device,
+                },
+            ))
+        return entities
+
+    def publish_selection_discovery(self, options: dict):
+        """Re-publish both select entities with a fresh options list
+        (called by the reconciler when the discovered device set changes,
+        and once from the loop at connect via the selection provider)."""
+        self._selection_options = {
+            "output": sorted(options.get("output", [])),
+            "tv_source": sorted(options.get("tv_source", [])),
+        }
+        if self.client is None:
+            return
+        base = self.cfg.mqtt_base_topic
+        dev_id = self.cfg.device_id
+        availability = self._availability_topic()
+        device = {
+            "identifiers": [dev_id],
+            "name": self.cfg.device_name,
+            "model": "Raspberry Pi 4B",
+            "manufacturer": "Custom Audio Hub",
+        }
+        for topic, payload in self._selection_discovery(base, dev_id, availability, device):
+            self._publish(topic, json.dumps(payload))
 
     # -- state publishing (asyncio loop thread) ---------------------------------
     def _publish_initial_state(self):
@@ -799,6 +1007,14 @@ class MQTTBridge:
         self.publish_ducking_state(st.get("ducking_enabled", True), st.get("ducked", False))
         for key in ("music", "bt", "tv"):
             self.publish_activity(key, st.get(key, False))
+        if self._selection_provider is not None:
+            try:
+                sel = self._selection_provider()
+                self.publish_selection_discovery(sel.get("options", {}))
+                for key in ("output", "tv_source"):
+                    self.publish_selection_state(key, sel.get("effective", {}).get(key))
+            except Exception as e:
+                log.warning(f"Could not publish selection state: {e}")
 
     def publish_volume(self, source: str, level: float):
         topic = (
@@ -817,6 +1033,13 @@ class MQTTBridge:
 
     def publish_activity(self, key: str, active: bool):
         self._publish(f"{self.cfg.device_id}/{key}/active", "ON" if active else "OFF")
+
+    def publish_selection_state(self, key: str, option: "str | None"):
+        """Publish the EFFECTIVE selection — the option currently applied to
+        the graph. None is skipped: HA keeps its last value."""
+        if option is None:
+            return
+        self._publish(f"{self.cfg.device_id}/{key}/state", option)
 
     def _publish(self, topic: str, payload: str):
         if self.client is None:
@@ -943,8 +1166,9 @@ class AudioControl:
     restarts, the connection is re-established on the next call.
     """
 
-    def __init__(self, config: HubConfig):
+    def __init__(self, config: HubConfig, selection: "SelectionStore | None" = None):
         self.cfg = config
+        self.selection = selection
         self._pulse = None
 
     def _conn(self):
@@ -978,11 +1202,102 @@ class AudioControl:
             return None
 
     def _find_lineout(self, pulse):
+        """Master volume/mute target. The user's Output Device selection
+        wins when it (still) resolves to a live hardware sink; if it is
+        absent (device unplugged), fall back to the unit.env pattern so the
+        master control keeps driving whatever is actually wired while the
+        reconciler holds routing state. Pattern is also the factory default
+        when no selection is in effect."""
+        if self.selection is not None:
+            desired = self.selection.get("output")
+            if desired:
+                name = resolve_option(
+                    desired, hardware_output_names([s.name for s in pulse.sink_list()]))
+                if name:
+                    for s in pulse.sink_list():
+                        if s.name == name:
+                            return s
+                log.debug(f"Selected output {desired!r} absent; master control on the pattern device")
         pat = self.cfg.lineout_sink_pattern.lower()
         for s in pulse.sink_list():
             if pat in (s.name or "").lower() or pat in (s.description or "").lower():
                 return s
         return None
+
+    def _find_tv_source(self, pulse):
+        """Factory-default TV source: substring pattern match (name or
+        description), unchanged legacy behavior."""
+        pat = self.cfg.tv_source_pattern.lower()
+        for s in pulse.source_list():
+            if pat in (s.name or "").lower() or pat in (s.description or "").lower():
+                return s
+        return None
+
+    def factory_defaults(self) -> dict:
+        """Factory-default selection options (stable prefixes) from the
+        unit.env patterns — used when selection.json holds no entry."""
+        def op(p):
+            out = self._find_lineout(p)
+            tv = self._find_tv_source(p)
+            return {
+                "output": node_prefix(out.name) if out else None,
+                "tv_source": node_prefix(tv.name) if tv else None,
+            }
+        return self._run(op) or {"output": None, "tv_source": None}
+
+    def routing_snapshot(self) -> "dict | None":
+        """Everything the selection reconciler needs in one round trip:
+        live sink/source name->index maps, each duct playback stream's
+        current sink index, and each TV loopback capture's current source
+        index."""
+        def op(p):
+            sinks = {s.name: s.index for s in p.sink_list()}
+            sources = {s.name: s.index for s in p.source_list()}
+            ducts = {}
+            for si in p.sink_input_list():
+                node = si.proplist.get("node.name", "")
+                if node in DUCT_PLAYBACK_NODES:
+                    ducts[node] = si.sink
+            captures = {}
+            for so in p.source_output_list():
+                node = so.proplist.get("node.name", "")
+                if node in TV_CAPTURE_NODES:
+                    captures[node] = so.source
+            return {"sinks": sinks, "sources": sources,
+                    "ducts": ducts, "tv_captures": captures}
+        return self._run(op)
+
+    def move_ducts_to_sink(self, sink_index: int) -> int:
+        """Move every duct playback stream to the given sink. Returns the
+        number of streams actually moved (idempotent: streams already on the
+        target are untouched, so a freshly booted unit on default wiring
+        performs no moves)."""
+        def op(p):
+            moved = 0
+            for si in p.sink_input_list():
+                node = si.proplist.get("node.name", "")
+                if node in DUCT_PLAYBACK_NODES and si.sink != sink_index:
+                    p.sink_input_move(si.index, sink_index)
+                    moved += 1
+            return moved
+        return self._run(op) or 0
+
+    def move_tv_capture_to_source(self, source_index: int, attached_to: set) -> int:
+        """Move TV loopback capture streams to the given source. Only
+        captures currently ATTACHED to one of `attached_to` (live hardware
+        sources) are moved: an unattached capture is waiting for its declared
+        candidate target, and moving it would defeat the dual-candidate
+        design that follows the UR23 profile flip."""
+        def op(p):
+            moved = 0
+            for so in p.source_output_list():
+                node = so.proplist.get("node.name", "")
+                if node in TV_CAPTURE_NODES and so.source in attached_to \
+                        and so.source != source_index:
+                    p.source_output_move(so.index, source_index)
+                    moved += 1
+            return moved
+        return self._run(op) or 0
 
     def _find_bus(self, pulse, name: str):
         for s in pulse.sink_list():
@@ -1058,9 +1373,14 @@ class HubDaemon:
         self.cfg = config
         self.stop_event = threading.Event()
         self.mqtt = MQTTBridge(config)
-        self.audio = AudioControl(config)
+        self.selection = SelectionStore()
+        self.audio = AudioControl(config, self.selection)
         self.ir = IRHandler(config, self.stop_event)
         self.ducking: DuckingEngine | None = None
+        # Reconciler bookkeeping: last published option lists and the last
+        # EFFECTIVE selection (what the graph is actually fed).
+        self._sel_options: dict = {"output": [], "tv_source": []}
+        self._sel_effective: dict = {"output": None, "tv_source": None}
 
         # MQTT command handlers (run on the asyncio loop)
         self.mqtt.on_volume_command("tv", self._on_tv_volume)
@@ -1069,7 +1389,9 @@ class HubDaemon:
         self.mqtt.on_volume_command("master", self._on_master_volume)
         self.mqtt.on_mute_command(self._on_mute_command)
         self.mqtt.on_ducking_command(self._on_ducking_command)
+        self.mqtt.on_selection_command(self._on_selection_command)
         self.mqtt.attach_state_provider(self._snapshot)
+        self.mqtt.attach_selection_provider(self._selection_snapshot)
 
         # IR callbacks (run on the asyncio loop)
         self.ir.on_volume_up(self._ir_volume_up)
@@ -1103,6 +1425,19 @@ class HubDaemon:
             self.ducking.set_enabled(enabled)
             # State is published when the engine applies it (_on_hub_state).
 
+    def _on_selection_command(self, key: str, payload: str):
+        """Output Device / TV Source select command from HA."""
+        if payload not in self._sel_options.get(key, []):
+            log.warning(f"Ignoring {key} selection {payload!r}: not in current options")
+            return
+        self.selection.set(key, payload)
+        log.info(f"{key} selection -> {payload}")
+        try:
+            # Apply immediately; the reconciler tick covers retries and drift.
+            self._reconcile_selection_tick()
+        except Exception as e:
+            log.warning(f"{key} selection apply failed (will retry): {e}")
+
     # -- IR callbacks (loop thread) -------------------------------------------------
     def _ir_volume_up(self):
         self._ir_step(+1)
@@ -1124,6 +1459,68 @@ class HubDaemon:
         self.audio.set_lineout_mute(muted)
         self.mqtt.publish_mute(muted)
         log.info(f"IR mute -> {'on' if muted else 'off'}")
+
+    # -- device selection reconciler (loop thread) ------------------------------
+    def _selection_snapshot(self) -> dict:
+        """Provider for the MQTT bridge at connect: run one reconcile tick
+        (fresh options, applies any pending selection) and report the
+        result."""
+        try:
+            self._reconcile_selection_tick()
+        except Exception as e:
+            log.debug(f"selection snapshot reconcile failed: {e}")
+        return {"options": dict(self._sel_options),
+                "effective": dict(self._sel_effective)}
+
+    def _reconcile_selection_tick(self):
+        """Device-selection reconciler (2 s cadence, on the loop). hubd is
+        the sole owner of routing state after boot; the declarative configs
+        are only cold-boot defaults. One tick: enumerate, republish options
+        when the device set changed, move streams whose target differs from
+        the resolved selection (covers boot, device arrival, and drift), and
+        publish effective state on change."""
+        snap = self.audio.routing_snapshot()
+        if snap is None:
+            return
+        outputs = hardware_output_names(list(snap["sinks"]))
+        captures = hardware_capture_names(list(snap["sources"]))
+
+        options = {"output": build_options(outputs),
+                   "tv_source": build_options(captures)}
+        if options != self._sel_options:
+            self._sel_options = options
+            self.mqtt.publish_selection_discovery(options)
+
+        defaults = self.audio.factory_defaults()
+        effective = dict(self._sel_effective)
+        for key, names in (("output", outputs), ("tv_source", captures)):
+            want = self.selection.get(key) or defaults.get(key)
+            if not want:
+                continue
+            resolved = resolve_option(want, names)
+            if resolved is None:
+                # Selected device absent: hold the last effective state.
+                log.debug(f"{key} selection {want!r} absent; holding {effective.get(key)!r}")
+                continue
+            effective[key] = want
+            if key == "output":
+                sink_index = snap["sinks"][resolved]
+                off_target = [n for n, i in snap["ducts"].items() if i != sink_index]
+                if off_target:
+                    moved = self.audio.move_ducts_to_sink(sink_index)
+                    log.info(f"Output {want!r}: moved {moved} duct stream(s) to {resolved}")
+            else:
+                hardware_idx = {snap["sources"][n] for n in captures}
+                off_target = [n for n, i in snap["tv_captures"].items()
+                              if i in hardware_idx and i != snap["sources"][resolved]]
+                if off_target:
+                    moved = self.audio.move_tv_capture_to_source(
+                        snap["sources"][resolved], hardware_idx)
+                    log.info(f"TV source {want!r}: moved {moved} capture stream(s) to {resolved}")
+        if effective != self._sel_effective:
+            self._sel_effective = effective
+            for key in ("output", "tv_source"):
+                self.mqtt.publish_selection_state(key, effective.get(key))
 
     # -- state ----------------------------------------------------------------------
     def _snapshot(self) -> dict:
@@ -1152,9 +1549,15 @@ class HubDaemon:
     async def _state_sync_loop(self):
         """Periodically compare actual audio state with what was last
         published, so HA stays truthful about volumes changed outside hubd
-        (wpctl, another client, IR from a previous instance, ...)."""
+        (wpctl, another client, IR from a previous instance, ...), and run
+        the device-selection reconciler on the same cadence."""
+        log.info("State sync + selection reconciler active (2 s cadence)")
         last: dict = {}
         while not self.stop_event.is_set():
+            try:
+                self._reconcile_selection_tick()
+            except Exception as e:
+                log.debug(f"selection reconcile error: {e}")
             snap = {}
             for source, bus in (("tv", self.cfg.bus_tv), ("bt", self.cfg.bus_bt),
                                 ("music", self.cfg.bus_music)):
@@ -1181,7 +1584,7 @@ class HubDaemon:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, self._request_stop)
 
-        self.ducking = DuckingEngine(self.cfg, loop, self.stop_event)
+        self.ducking = DuckingEngine(self.cfg, loop, self.stop_event, self.selection)
         self.ducking.on_change(self._on_hub_state)
         # The IR worker thread dispatches keypresses onto this loop; without
         # this the handler logs keys but silently drops them.

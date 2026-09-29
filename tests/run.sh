@@ -1,14 +1,28 @@
 #!/bin/bash
-# Run the release/update machinery test harnesses (no network, no root:
-# GitHub API and downloads are mocked; paths are redirected to a temp dir).
-# Run from the repo root:
+# Run the test harnesses from the repo root:
 #   bash tests/run.sh
+#
+# - release-logic.sh / update-flow.sh: bash harnesses for the bootstrap and
+#   self-update machinery (GitHub API and downloads mocked; no network,
+#   no root).
+# - test_device_selection.py / test_selection_reconcile.py: hubd device
+#   selection unit + integration tests (need .venv with pulsectl,
+#   paho-mqtt, evdev — the same system packages the Pi installs).
 set -u
 cd "$(dirname "$0")/.."
 rc=0
 for t in tests/release-logic.sh tests/update-flow.sh; do
     echo "### $t"
-    bash "$t" || rc=1
+    bash "$t" 2>/dev/null | tail -1 || rc=1
     echo
 done
+if [ -x .venv/bin/python ]; then
+    for t in tests/test_device_selection.py tests/test_selection_reconcile.py; do
+        echo "### $t"
+        .venv/bin/python "$t" 2>&1 | tail -1 || rc=1
+        echo
+    done
+else
+    echo "(.venv missing — skipping hubd python tests)"
+fi
 exit $rc
