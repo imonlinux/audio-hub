@@ -57,11 +57,16 @@ hubd enumerates with `pactl`-equivalent Pulse list calls on its existing
 loop-owned connection (no new dependency):
 
 - **Output options** — `sink_list()`, keep hardware sinks: name starts with
-  `alsa_output.` (and, defensively, `bluez_sink.` is excluded alongside).
-  Exclude: `bus.*`, `auto_null*` (PipeWire's fallback placeholder).
+  `alsa_output.`. Exclude: `bus.*`, `auto_null*` (PipeWire's fallback
+  placeholder), `bluez_sink.*` (decided 2026-09-29: BT speakers are not
+  selectable outputs this pass — ducking semantics and the single-stack
+  guarantee were designed around wired output; revisit if a use case
+  appears).
 - **TV source options** — `source_list()`, keep hardware capture nodes:
-  name starts with `alsa_input.`. Exclude: `*.monitor` (any sink monitor,
-  including bus and hardware monitors), `bluez_source.*`.
+  name starts with `alsa_input.` (decided 2026-09-29: *all* hardware
+  captures are listed; S/PDIF-capability filtering would add device-model
+  coupling for no real-world unit today). Exclude: `*.monitor` (any sink
+  monitor, including bus and hardware monitors), `bluez_source.*`.
 
 The bus/duct loopback nodes never appear in either list: loopback capture and
 playback sides are client streams (source-outputs / sink-inputs), not source
@@ -114,6 +119,11 @@ ordinary property changes on existing streams — no stream rebuild:
 - **Output** → every `duct.*.playback` sink-input is moved to the resolved
   sink with `sink_input_move()`. All three ducts move together; the output
   device is a unit-wide choice. Instant, no dropout.
+- **Master volume/mute target follows the output** (decided 2026-09-29):
+  `AudioControl._find_lineout` resolves the *selected* output sink first and
+  falls back to the `AUDIOHUB_LINEOUT_PATTERN` match only when no selection
+  is in effect. Without this, a selection change would leave IR keys and the
+  HA master slider driving the previous device.
 - **TV source** → the active TV loopback's capture side (the source-output
   whose `node.name` is `loopback.tv.capture` / `loopback.tv2.capture`) is
   moved to the resolved source with `source_output_move()`. Only the TV path
@@ -181,7 +191,7 @@ labelled bootstrap defaults; no format change.
 
 | File | Change |
 |---|---|
-| `hubd/main.py` | Device enumeration + prefix resolution helpers; two `select` entities in `_publish_discovery`; command handling for `output/set`, `tv_source/set`; reconciler step in the state-sync loop; `AudioControl.move_ducts_to_sink()` / `move_tv_capture_to_source()`. |
+| `hubd/main.py` | Device enumeration + prefix resolution helpers; two `select` entities in `_publish_discovery`; command handling for `output/set`, `tv_source/set`; reconciler step in the state-sync loop; `AudioControl.move_ducts_to_sink()` / `move_tv_capture_to_source()`; `_find_lineout` resolves the selected output before the `AUDIOHUB_LINEOUT_PATTERN` fallback. |
 | `unit.env.example` | Comments noting the keys are factory defaults overridden by `selection.json`. |
 | `docs/qa-disposition` follow-up | The duct hardcode finding (50-ducts.conf) is superseded by this spec once implemented. |
 | `README.md` | Architecture section: output/source selection via HA entities; drops the "specific hardware" caveat once verified. |
@@ -198,7 +208,9 @@ Reproducible on a unit, per the disposition doc's methodology:
 1. `mosquitto_sub -t "<id>/#" -v` — see both select states and options.
 2. Plug a second output (any USB DAC); within one sync tick the options list
    contains it; select it; `pw-link -l` shows all duct playback ports on the
-   new sink; audio continues without dropout.
+   new sink; audio continues without dropout. IR volume keys and the HA
+   master slider now change the **DAC's** sink volume (verify via
+   `pactl list sinks` or the MQTT state topic), not the built-in's.
 3. Unplug it; ducts relocate per PipeWire default handling; select the
    built-in again; graph normal, no rogue links (`check_no_feedback` clean).
 4. TV source: with only the UR23 present, options show it; toggle the TV's
@@ -207,17 +219,14 @@ Reproducible on a unit, per the disposition doc's methodology:
    (idempotence), graph identical to today.
 6. `selection.json` round-trip: rm the file → factory defaults reapply.
 
-## 8. Open questions
+## 8. Decision record
 
-1. Should the output selection also drive the master-volume target
-   (`AUDIOHUB_LINEOUT_PATTERN` matching in `AudioControl`), so IR/HA master
-   volume follows the selected output? Recommended: yes — master volume
-   should attach to whichever sink the ducts feed, otherwise volume controls
-   the wrong device after a selection change.
-2. TV Source options: expose *all* hardware captures, or only those with an
-   S/PDIF-capable profile? Recommended: all hardware captures; profile
-   filtering adds coupling for no real-world unit today.
-3. Should a BT sink ever be selectable as output (hub feeding a BT speaker)?
-   The A2DP sink path exists, but ducking semantics and the single-stack
-   guarantee were designed around analog out. Recommended: keep BT excluded
-   from the output list this pass; revisit if a use case appears.
+All open questions from the first draft were decided by the operator on
+2026-09-29 and are folded into the body above:
+
+1. **Master volume tracks the selected output** — accepted (§4.4). IR and HA
+   master volume always drive the sink the ducts feed.
+2. **TV Source lists all hardware captures** — accepted (§4.1). No
+   S/PDIF-capability filtering.
+3. **BT speakers excluded from the output list** — accepted for this pass
+   (§4.1). Ducking semantics and the single-stack guarantee stay wired-out.
