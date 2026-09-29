@@ -27,6 +27,8 @@ Sendspin ──PIPEWIRE_NODE──▶ [bus.music] ──duct.music──▶
 
 hubd (single daemon) does ducking (poll, 0.5 s), MQTT/Home Assistant entities, and FLIRC IR volume/mute.
 
+The **Output Device** and **TV Source** Home Assistant select entities route the graph at runtime (no config edits, no restarts): sources and the output are picked from what is actually plugged in, keyed by stable node-name prefixes, persisted in `~/.config/audiohub/selection.json`, and reconciled by hubd every 2 s. Bluetooth and Sendspin stay name-routed by their own connection lifecycle and are never selectable. See `docs/device-selection-spec.md`.
+
 ## Deploy a new unit
 
 Everything except the physical work (flashing, cabling) is one command on the Pi.

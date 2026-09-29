@@ -227,6 +227,17 @@ check_updates() {
     fi
 }
 
+check_selection() {
+    echo ""
+    echo "=== Device Selection ==="
+    if journalctl --user -u hubd.service --no-pager 2>/dev/null \
+        | grep -qi "selection reconciler active"; then
+        pass "Device-selection reconciler active"
+    else
+        fail "Selection reconciler not detected in the hubd journal (hubd build predates device selection?)"
+    fi
+}
+
 print_summary() {
     echo ""
     echo "=== Summary ==="
@@ -254,6 +265,7 @@ main() {
 	check_linger
 	check_wifi
 	check_updates
+	check_selection
 	print_summary
 }
 

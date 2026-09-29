@@ -218,6 +218,24 @@ install_config() {
     cp "$REPO_DIR"/config/wireplumber.conf.d/*.conf "$wp_dir/"
     chown -R "$PI_USER:$PI_USER" "$PI_HOME/.config/wireplumber"
 
+    # Template the ducts' bootstrap target for THIS hardware. The repo conf
+    # hardcodes the Pi 4B built-in node, which does not exist on other
+    # boards (a Pi 5 would cold-boot with the ducts waiting on a phantom
+    # target). Best effort: resolving the node needs the hub user's
+    # PipeWire running — true when re-running on an installed unit; on a
+    # fresh first-boot install the default-sink fallback covers boot and
+    # hubd's selection reconciler applies the factory default within
+    # seconds of starting.
+    local out_node
+    out_node="$(as_pi pactl list short sinks 2>/dev/null \
+        | awk '$2 ~ /^alsa_output\./ { print $2; exit }')"
+    if [ -n "$out_node" ] \
+        && ! grep -qF "$out_node" "$pw_dir/50-ducts.conf"; then
+        sed -i "s|alsa_output\.platform-fe00b840\.mailbox\.stereo-fallback|$out_node|g" \
+            "$pw_dir/50-ducts.conf"
+        log_info "Duct bootstrap target templated to this hardware: $out_node"
+    fi
+
     # Bluetooth configuration
     cp "$REPO_DIR/config/bluetooth/main.conf" /etc/bluetooth/main.conf
     systemctl restart bluetooth || log_warn "Could not restart bluetooth (continuing)"
