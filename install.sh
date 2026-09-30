@@ -351,10 +351,15 @@ install_services() {
 }
 
 configure_wifi() {
-    # Device-specific; opt-in via AUDIOHUB_WIFI_CONNECTION=<ssid>
+    # Optional WiFi reliability tuning for a named NetworkManager connection
+    # (documented in unit.env.example). The unit.env key is the source of
+    # truth; an explicit env var overrides it for one-shot installs.
     local conn="${AUDIOHUB_WIFI_CONNECTION:-}"
+    if [ -z "$conn" ] && [ -f "$UNIT_ENV" ]; then
+        conn="$(grep -E '^AUDIOHUB_WIFI_CONNECTION=' "$UNIT_ENV" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')"
+    fi
     if [ -z "$conn" ]; then
-        log_info "AUDIOHUB_WIFI_CONNECTION not set; skipping WiFi tuning"
+        log_info "AUDIOHUB_WIFI_CONNECTION not configured (optional); skipping WiFi tuning"
         return
     fi
     if nmcli connection show "$conn" &>/dev/null; then

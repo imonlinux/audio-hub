@@ -184,15 +184,19 @@ check_linger() {
 check_wifi() {
     echo ""
     echo "=== WiFi (optional) ==="
+    # unit.env is the source of truth; env override for ad-hoc runs
     local conn="${AUDIOHUB_WIFI_CONNECTION:-}"
+    if [ -z "$conn" ] && [ -r "$UNIT_ENV" ]; then
+        conn="$(grep -E '^AUDIOHUB_WIFI_CONNECTION=' "$UNIT_ENV" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')"
+    fi
     if [ -z "$conn" ]; then
-        warn "AUDIOHUB_WIFI_CONNECTION not set; skipping"
-        return
+        echo "  (optional) AUDIOHUB_WIFI_CONNECTION not configured — skipping"
+        return 0
     fi
     if nmcli connection show "$conn" &>/dev/null; then
         pass "WiFi connection '$conn' present"
     else
-        warn "WiFi connection '$conn' not found"
+        warn "WiFi connection '$conn' not found (set in unit.env but no such NetworkManager connection)"
     fi
 }
 

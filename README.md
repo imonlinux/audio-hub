@@ -89,7 +89,7 @@ Channels and per-unit settings live in `unit.env`:
 
 ## Configuration
 
-`/etc/audiohub/unit.env` — see `unit.env.example` for all fields. Device identity, MQTT, ducking, IR, and release-update behavior are all set there.
+`/etc/audiohub/unit.env` — see `unit.env.example` for all fields. Device identity, MQTT, ducking, IR, and release-update behavior are all set there. One key deserves a note: setting `AUDIOHUB_WIFI_CONNECTION=<nm-connection-name>` opts a WiFi unit into reliability tuning (unlimited autoconnect/auth retries, connection-level power-save off), applied by the installer — set it and re-run the installer to apply. Leave unset on wired units.
 
 ## Services
 
