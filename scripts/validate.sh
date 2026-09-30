@@ -187,7 +187,7 @@ check_wifi() {
     # unit.env is the source of truth; env override for ad-hoc runs
     local conn="${AUDIOHUB_WIFI_CONNECTION:-}"
     if [ -z "$conn" ] && [ -r "$UNIT_ENV" ]; then
-        conn="$(grep -E '^AUDIOHUB_WIFI_CONNECTION=' "$UNIT_ENV" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')"
+        conn="$(grep -E '^AUDIOHUB_WIFI_CONNECTION=' "$UNIT_ENV" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' || true)"
     fi
     if [ -z "$conn" ]; then
         echo "  (optional) AUDIOHUB_WIFI_CONNECTION not configured — skipping"

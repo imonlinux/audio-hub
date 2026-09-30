@@ -150,6 +150,28 @@ check "seed upPI-host"      "upPI-host|uppi_host|Uppi Host"              "$(seed
 check "seed dots"           "a.b--c|a_b_c|A B C"                          "$(seed a.b--c)"
 check "seed 2nd-floor"      "2nd-floor|2nd_floor|2nd Floor"               "$(seed 2nd-floor)"
 
+echo "== installer env extraction (set -euo pipefail safety) =="
+# Regression: configure_wifi greps unit.env inside a command substitution.
+# Under set -euo pipefail, a no-match grep in an unguarded assignment ABORTS
+# the installer (observed: install.sh died after 'Services installed' on
+# units without AUDIOHUB_WIFI_CONNECTION). The line below must carry '|| true'.
+cat > "$FIXTURES/extract.sh" <<'EXTRACT'
+set -euo pipefail
+UNIT_ENV="$1"
+conn="$(grep -E '^AUDIOHUB_WIFI_CONNECTION=' "$UNIT_ENV" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' || true)"
+echo "conn=${conn:-(unset)}"
+EXTRACT
+printf 'AUDIOHUB_OTHER=1\n' > "$FIXTURES/env-nokey.env"
+check "missing key survives set -e" "conn=(unset)" "$(bash "$FIXTURES/extract.sh" "$FIXTURES/env-nokey.env")"
+printf 'AUDIOHUB_WIFI_CONNECTION=McWiFi\n' > "$FIXTURES/env-key.env"
+check "present key extracted" "conn=McWiFi" "$(bash "$FIXTURES/extract.sh" "$FIXTURES/env-key.env")"
+# and the actual installer source must carry the guard on that line
+grep_line="$(grep "conn=.*AUDIOHUB_WIFI_CONNECTION=" install.sh || true)"
+case "$grep_line" in
+    *"|| true"*) ok "install.sh env grep carries the || true guard" ;;
+    *) fail "install.sh env grep lost its || true guard (line: $grep_line)" ;;
+esac
+
 echo ""
 echo "=== $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ]

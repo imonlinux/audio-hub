@@ -356,7 +356,8 @@ configure_wifi() {
     # truth; an explicit env var overrides it for one-shot installs.
     local conn="${AUDIOHUB_WIFI_CONNECTION:-}"
     if [ -z "$conn" ] && [ -f "$UNIT_ENV" ]; then
-        conn="$(grep -E '^AUDIOHUB_WIFI_CONNECTION=' "$UNIT_ENV" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')"
+        # '|| true': under set -euo pipefail a no-match grep must not abort
+        conn="$(grep -E '^AUDIOHUB_WIFI_CONNECTION=' "$UNIT_ENV" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' || true)"
     fi
     if [ -z "$conn" ]; then
         log_info "AUDIOHUB_WIFI_CONNECTION not configured (optional); skipping WiFi tuning"
