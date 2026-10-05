@@ -1,0 +1,56 @@
+# Release automation: pushing a v* tag publishes a pre-release ("canary")
+# with sha256 checksums of the exact archives devices download.
+#
+#   canary channel  = newest release, pre-release or not
+#   stable channel  = newest release with the pre-release flag unticked
+#
+# Promotion to stable is deliberately manual: validate the pre-release on
+# your own hardware (set AUDIOHUB_RELEASE_CHANNEL=canary there), then edit
+# the release on GitHub and untick "Set as a pre-release". Stable units
+# pick it up on their next weekly check.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the tag archives devices will fetch
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          mkdir -p dist
+          curl -fsSL "https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${TAG}.tar.gz" \
+            -o "dist/audio-hub-${TAG}.tar.gz"
+          curl -fsSL "https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${TAG}.zip" \
+            -o "dist/audio-hub-${TAG}.zip"
+
+      - name: Checksum the archives
+        run: |
+          (cd dist && sha256sum "audio-hub-${GITHUB_REF_NAME}.tar.gz" \
+                              "audio-hub-${GITHUB_REF_NAME}.zip" > sha256sums.txt)
+          cat sha256sums.txt
+
+      - name: Create the pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --prerelease \
+            --title "audio-hub ${GITHUB_REF_NAME}" \
+            --notes "Release ${GITHUB_REF_NAME}.
+
+          Published automatically as a **pre-release** (canary channel).
+
+          Promote to stable after validating on hardware: edit this release
+          on GitHub and untick **Set as a pre-release**. Stable-channel units
+          update themselves at the next weekly check." \
+            dist/sha256sums.txt \
+            "dist/audio-hub-${GITHUB_REF_NAME}.tar.gz" \
+            "dist/audio-hub-${GITHUB_REF_NAME}.zip"

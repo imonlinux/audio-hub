@@ -4,9 +4,10 @@
 # Idempotent installer for the Audio Hub system. Run as root on the Pi:
 #   sudo ./install.sh
 #
-# Everything user-level runs as the 'pi' user (override with
-# AUDIOHUB_USER=<name>). The installer enables linger so the user's
-# PipeWire session and services start at boot without a login.
+# Everything user-level runs as the hub user — resolved as AUDIOHUB_USER,
+# then 'pi', then the first regular user on the system. The installer
+# enables linger so the user's PipeWire session and services start at
+# boot without a login.
 
 set -euo pipefail
 
@@ -18,10 +19,14 @@ NC='\033[0m'
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_DIR="/etc/audiohub"
 UNIT_ENV="$CONFIG_DIR/unit.env"
-PI_USER="${AUDIOHUB_USER:-pi}"
-PI_UID="$(id -u "$PI_USER" 2>/dev/null || echo "")"
+PI_USER=""
+PI_UID=""
 PI_HOME=""
 HUBD_PKG_DIR="/usr/local/lib/python3/dist-packages/hubd"
+# The sendspin release the ducking hooks were validated against; override
+# with AUDIOHUB_SENDSPIN_VERSION (env or unit.env) — only change it after
+# re-verifying hook behavior on hardware.
+SENDSPIN_PIN="7.5.0"
 
 log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
@@ -53,8 +58,24 @@ check_os() {
 }
 
 check_user() {
-    if ! id "$PI_USER" &>/dev/null; then
-        log_error "User '$PI_USER' does not exist. Create it first (standard Raspberry Pi OS login)."
+    # Resolution order: explicit AUDIOHUB_USER env, then the value recorded
+    # in unit.env by a previous install (keeps manual re-runs on the same
+    # user as the release updater), then the classic 'pi' login, then the
+    # first regular user (newer Raspberry Pi Imager flows create a named
+    # user instead of 'pi').
+    if [ -z "${AUDIOHUB_USER:-}" ] && [ -r "$UNIT_ENV" ]; then
+        AUDIOHUB_USER="$(grep -E '^AUDIOHUB_USER=' "$UNIT_ENV" 2>/dev/null | tail -1 | cut -d= -f2- | sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//' || true)"
+    fi
+    if [ -n "${AUDIOHUB_USER:-}" ]; then
+        PI_USER="$AUDIOHUB_USER"
+    elif id pi &>/dev/null; then
+        PI_USER="pi"
+    else
+        PI_USER="$(awk -F: '$3 >= 1000 && $1 != "nobody" && $6 != "" && $7 !~ /(false|nologin)$/ { print $1; exit }' /etc/passwd)"
+    fi
+    if [ -z "$PI_USER" ] || ! id "$PI_USER" &>/dev/null; then
+        log_error "No hub user found. Create a user first (Raspberry Pi Imager does this), or run:"
+        log_error "  sudo AUDIOHUB_USER=<name> ./install.sh"
         exit 1
     fi
     PI_UID="$(id -u "$PI_USER")"
@@ -159,11 +180,35 @@ install_config() {
     mkdir -p "$CONFIG_DIR"
     if [ ! -f "$UNIT_ENV" ]; then
         cp "$REPO_DIR/unit.env.example" "$UNIT_ENV"
-        chmod 644 "$UNIT_ENV"
-        log_warn "Created $UNIT_ENV from template"
-        log_warn ">>> EDIT THIS FILE (MQTT credentials, device name) BEFORE REBOOT <<<"
+        # Seed identity from the actual hostname: a fresh unit must not ship
+        # another unit's identity (the example carries placeholder values).
+        local host id name
+        host="$(hostname)"
+        id="$(printf '%s' "$host" | tr 'A-Z' 'a-z' | sed -E 's/[^a-z0-9]+/_/g; s/^_+//; s/_+$//')"
+        [ -n "$id" ] || id="audio_hub"
+        name="$(printf '%s' "$host" | tr 'A-Z' 'a-z' | sed -E 's/[-_.]+/ /g; s/\b([a-z])/\u\1/g')"
+        sed -i \
+            -e "s|^AUDIOHUB_HOSTNAME=.*|AUDIOHUB_HOSTNAME=$host|" \
+            -e "s|^AUDIOHUB_DEVICE_ID=.*|AUDIOHUB_DEVICE_ID=$id|" \
+            -e "s|^AUDIOHUB_DEVICE_NAME=.*|AUDIOHUB_DEVICE_NAME=$name|" \
+            "$UNIT_ENV"
+        log_warn "Created $UNIT_ENV from template (identity seeded from hostname '$host')"
+        log_warn ">>> EDIT THIS FILE (MQTT credentials) BEFORE REBOOT <<<"
     else
         log_info "$UNIT_ENV already exists, keeping it"
+    fi
+    # hubd and the sendspin provisioning read this file as the hub user;
+    # it carries the MQTT password, so keep it group-readable only.
+    chown "root:$PI_USER" "$UNIT_ENV"
+    chmod 640 "$UNIT_ENV"
+
+    # Record the resolved hub user: the release updater and a re-run
+    # bootstrap must target the same user even if the fallback order
+    # (pi -> first regular user) would resolve differently later.
+    if grep -qE '^AUDIOHUB_USER=' "$UNIT_ENV"; then
+        sed -i "s|^AUDIOHUB_USER=.*|AUDIOHUB_USER=$PI_USER|" "$UNIT_ENV"
+    else
+        printf '\n# Hub user (recorded by the installer; drives the release updater)\nAUDIOHUB_USER=%s\n' "$PI_USER" >> "$UNIT_ENV"
     fi
 
     # PipeWire configuration (virtual buses, clock, TV loopback, ducts)
@@ -177,6 +222,31 @@ install_config() {
     mkdir -p "$wp_dir"
     cp "$REPO_DIR"/config/wireplumber.conf.d/*.conf "$wp_dir/"
     chown -R "$PI_USER:$PI_USER" "$PI_HOME/.config/wireplumber"
+
+    # Template the ducts' bootstrap target for THIS hardware. The repo conf
+    # hardcodes the Pi 4B built-in node, which does not exist on other
+    # boards (a Pi 5 would cold-boot with the ducts waiting on a phantom
+    # target). Best effort: resolving the node needs the hub user's
+    # PipeWire running — true when re-running on an installed unit; on a
+    # fresh first-boot install the default-sink fallback covers boot and
+    # hubd's selection reconciler applies the factory default within
+    # seconds of starting.
+    local out_node
+    # Prefer the built-in ANALOG output: with HDMI sinks present, "first
+    # alsa_output" is registration-ordered and can be an HDMI node, which
+    # would make the cold-boot default inaudible until hubd reconciles.
+    out_node="$(as_pi pactl list short sinks 2>/dev/null \
+        | awk '$2 ~ /^alsa_output\./ && $2 ~ /(analog-stereo|stereo-fallback|mailbox)/ { print $2; exit }')"
+    if [ -z "$out_node" ]; then
+        out_node="$(as_pi pactl list short sinks 2>/dev/null \
+            | awk '$2 ~ /^alsa_output\./ { print $2; exit }')"
+    fi
+    if [ -n "$out_node" ] \
+        && ! grep -qF "$out_node" "$pw_dir/50-ducts.conf"; then
+        sed -i "s|alsa_output\.platform-fe00b840\.mailbox\.stereo-fallback|$out_node|g" \
+            "$pw_dir/50-ducts.conf"
+        log_info "Duct bootstrap target templated to this hardware: $out_node"
+    fi
 
     # Bluetooth configuration
     cp "$REPO_DIR/config/bluetooth/main.conf" /etc/bluetooth/main.conf
@@ -206,19 +276,35 @@ install_hubd() {
 install_sendspin() {
     log_info "Installing Sendspin client..."
 
+    # Allow a per-unit pin override from unit.env (installed by now) or env;
+    # otherwise hold the version the ducking hooks were validated against.
+    local pin
+    pin="$(grep -E '^AUDIOHUB_SENDSPIN_VERSION=' "$UNIT_ENV" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' || true)"
+    pin="${pin:-${AUDIOHUB_SENDSPIN_VERSION:-$SENDSPIN_PIN}}"
+
+    local uv="$PI_HOME/.local/bin/uv"
     local bin="$PI_HOME/.local/bin/sendspin"
-    if [ ! -x "$bin" ]; then
-        # Install uv + the sendspin tool under the hub user's home, which is
-        # what the official installer does when run via sudo. We skip the
-        # official script's system-level unit entirely (we provide our own
-        # user unit).
-        as_pi bash -c 'curl -LsSf https://astral.sh/uv/install.sh | sh' \
-            || { log_error "uv installation failed"; exit 1; }
-        as_pi "$PI_HOME/.local/bin/uv" tool install sendspin \
-            || { log_error "sendspin installation failed"; exit 1; }
+    local current=""
+    if [ -x "$uv" ]; then
+        current="$(as_pi "$uv" tool list 2>/dev/null | awk '/^sendspin /{gsub(/^v/, "", $2); print $2}')"
+    fi
+
+    if [ "$current" = "$pin" ]; then
+        log_info "sendspin already at pinned version $pin"
     else
-        log_info "sendspin already installed, upgrading"
-        as_pi "$PI_HOME/.local/bin/uv" tool upgrade sendspin || true
+        if [ ! -x "$uv" ]; then
+            # Install uv under the hub user's home, which is what the
+            # official installer does when run via sudo. We skip the
+            # official script's system-level unit entirely (we provide our
+            # own user unit).
+            as_pi bash -c 'curl -LsSf https://astral.sh/uv/install.sh | sh' \
+                || { log_error "uv installation failed"; exit 1; }
+        fi
+        if [ -n "$current" ]; then
+            log_info "Upgrading sendspin: $current -> $pin (pinned)"
+        fi
+        as_pi "$uv" tool install --reinstall "sendspin==$pin" \
+            || { log_error "sendspin $pin installation failed"; exit 1; }
     fi
 
     # Boot-time settings sync (identity + stable device name + hooks)
@@ -241,6 +327,13 @@ install_services() {
     install -m 644 "$REPO_DIR/systemd/system/wifi-powersave-off.service" /etc/systemd/system/
     install -m 755 "$REPO_DIR/scripts/bluetooth-setup.sh" /usr/local/sbin/bluetooth-setup.sh
 
+    # Release updater: script + weekly timer. The timer is enabled for every
+    # unit; AUDIOHUB_AUTO_UPDATE=false in unit.env makes the scheduled run a
+    # no-op (manual 'sudo audiohub-update' always works).
+    install -m 755 "$REPO_DIR/scripts/audiohub-update" /usr/local/sbin/audiohub-update
+    install -m 644 "$REPO_DIR/systemd/system/audiohub-update.service" /etc/systemd/system/
+    install -m 644 "$REPO_DIR/systemd/system/audiohub-update.timer" /etc/systemd/system/
+
     # User services
     local user_dir="$PI_HOME/.config/systemd/user"
     mkdir -p "$user_dir"
@@ -254,6 +347,7 @@ install_services() {
     systemctl enable --now bt-agent.service
     systemctl enable --now bluetooth-setup.service
     systemctl enable --now wifi-powersave-off.service
+    systemctl enable --now audiohub-update.timer
 
     # User services: enabled inside the hub user's manager
     if [ -d "/run/user/$PI_UID" ]; then
@@ -269,10 +363,16 @@ install_services() {
 }
 
 configure_wifi() {
-    # Device-specific; opt-in via AUDIOHUB_WIFI_CONNECTION=<ssid>
+    # Optional WiFi reliability tuning for a named NetworkManager connection
+    # (documented in unit.env.example). The unit.env key is the source of
+    # truth; an explicit env var overrides it for one-shot installs.
     local conn="${AUDIOHUB_WIFI_CONNECTION:-}"
+    if [ -z "$conn" ] && [ -f "$UNIT_ENV" ]; then
+        # '|| true': under set -euo pipefail a no-match grep must not abort
+        conn="$(grep -E '^AUDIOHUB_WIFI_CONNECTION=' "$UNIT_ENV" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' || true)"
+    fi
     if [ -z "$conn" ]; then
-        log_info "AUDIOHUB_WIFI_CONNECTION not set; skipping WiFi tuning"
+        log_info "AUDIOHUB_WIFI_CONNECTION not configured (optional); skipping WiFi tuning"
         return
     fi
     if nmcli connection show "$conn" &>/dev/null; then
@@ -286,12 +386,31 @@ configure_wifi() {
     fi
 }
 
+stamp_version() {
+    # Where the deployed bits came from: release tag (bootstrap/updater leave
+    # .release-tag in the tree) or git describe (developer checkouts).
+    local version=""
+    if [ -f "$REPO_DIR/.release-tag" ]; then
+        version="$(cat "$REPO_DIR/.release-tag")"
+    elif [ -d "$REPO_DIR/.git" ]; then
+        version="$(git -C "$REPO_DIR" describe --tags --always 2>/dev/null || true)"
+    fi
+    if [ -n "$version" ]; then
+        echo "$version" > "$CONFIG_DIR/version"
+        chmod 644 "$CONFIG_DIR/version"
+        log_info "Deployed version: $version"
+    fi
+}
+
 validate_install() {
     log_info "Validating installation..."
 
     local failed=0
 
     [ -f "$UNIT_ENV" ] || { log_error "$UNIT_ENV missing"; failed=1; }
+    if grep -q "your_password_here" "$UNIT_ENV" 2>/dev/null; then
+        log_warn "unit.env still carries the placeholder MQTT password — set real credentials before reboot"
+    fi
     grep -q "bus.tv" "$PI_HOME/.config/pipewire/pipewire.conf.d/"*.conf \
         || { log_error "Virtual bus configuration missing"; failed=1; }
     grep -q "duct.tv" "$PI_HOME/.config/pipewire/pipewire.conf.d/"*.conf \
@@ -299,6 +418,7 @@ validate_install() {
     grep -q "monitor.channel-volumes" "$PI_HOME/.config/pipewire/pipewire.conf.d/20-virtual-buses.conf" \
         || { log_error "20-virtual-buses.conf is missing monitor.channel-volumes (volume would be inaudible)"; failed=1; }
     [ -x /usr/local/bin/hubd ] || { log_error "hubd not installed"; failed=1; }
+    [ -x /usr/local/sbin/audiohub-update ] || { log_error "audiohub-update not installed"; failed=1; }
     python3 -c "import paho.mqtt, pulsectl, evdev" 2>/dev/null \
         || { log_error "Python dependencies not importable (paho-mqtt/pulsectl/evdev)"; failed=1; }
     loginctl show-user "$PI_USER" --property=Linger 2>/dev/null | grep -q yes \
@@ -315,11 +435,15 @@ print_status() {
     log_info "Installation complete!"
     echo ""
     echo "Next steps:"
-    echo "  1. Edit $UNIT_ENV — set MQTT host/credentials and the device identity."
+    echo "  1. Edit $UNIT_ENV — set MQTT host/credentials (identity is seeded;"
+    echo "     adjust if needed)."
     echo "  2. Reboot to load all configs:   sudo reboot"
     echo "  3. After reboot, verify as $PI_USER (not root):"
     echo "       systemctl --user status hubd.service sendspin.service"
     echo "       bash $REPO_DIR/scripts/validate.sh"
+    echo ""
+    echo "Updates: the unit checks the release channel weekly (Sun 04:30 +"
+    echo "jitter). Manual check: sudo audiohub-update --check"
     echo ""
     echo "Bluetooth pairing uses bt-agent (auto-accept). The adapter is made"
     echo "discoverable at boot by bluetooth-setup.service."
@@ -340,6 +464,7 @@ main() {
     install_sendspin
     install_services
     configure_wifi
+    stamp_version
     validate_install
     print_status
 }

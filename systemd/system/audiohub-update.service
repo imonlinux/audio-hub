@@ -1,0 +1,14 @@
+[Unit]
+Description=Audio Hub release update (audiohub-update)
+Documentation=https://github.com/imonlinux/audio-hub#updating
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# --scheduled makes the unit config's AUDIOHUB_AUTO_UPDATE flag authoritative:
+# the timer is installed for everyone, but units with auto-update disabled
+# exit quietly. Manual runs (no --scheduled) always apply.
+ExecStart=/usr/local/sbin/audiohub-update --scheduled
+# Failures land in the journal; the timer just fires again next week.
+SyslogIdentifier=audiohub-update

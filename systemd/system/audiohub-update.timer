@@ -1,0 +1,14 @@
+[Unit]
+Description=Weekly Audio Hub release check
+Documentation=https://github.com/imonlinux/audio-hub#updating
+
+[Timer]
+# Weekly window: Sunday 04:30 + up to one hour of jitter, so a household of
+# units (and the broker they talk to) never updates simultaneously.
+OnCalendar=Sun *-*-* 04:30:00
+RandomizedDelaySec=1h
+# If the Pi was off at fire time, run the check at the next boot.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,6 +1,7 @@
 # Runtime Device Selection Spec
 
-Status: PROPOSED (not implemented)
+Status: IMPLEMENTED on the `enhancements` branch (unit-tested; hardware
+validation per §7 pending)
 
 Motivation: the graph's hardware coupling is baked into two config files —
 `40-loopback-tv.conf` (UR23 candidate node names) and `50-ducts.conf` (the
@@ -123,11 +124,24 @@ ordinary property changes on existing streams — no stream rebuild:
   `AudioControl._find_lineout` resolves the *selected* output sink first and
   falls back to the `AUDIOHUB_LINEOUT_PATTERN` match only when no selection
   is in effect. Without this, a selection change would leave IR keys and the
-  HA master slider driving the previous device.
+  HA master slider driving the previous device. (Implementation refinement,
+  decided 2026-09-29: when a selection exists but its device is absent, the
+  pattern device is used and the gap logged — a dead master control is worse
+  than factory behavior while the selected DAC is unplugged; routing state
+  is held separately by the reconciler.)
 - **TV source** → the active TV loopback's capture side (the source-output
   whose `node.name` is `loopback.tv.capture` / `loopback.tv2.capture`) is
-  moved to the resolved source with `source_output_move()`. Only the TV path
-  gaps (one quantum-scale transition); BT/music are untouched.
+  moved to the resolved source with `source_output_move()`. Only captures
+  currently ATTACHED to a live hardware source are moved: an unattached
+  capture is waiting for its declared candidate target, and moving it would
+  defeat the dual-candidate design that follows the UR23 profile flip. Only
+  the TV path gaps (one quantum-scale transition); BT/music are untouched.
+- **TV Playing sensor probe follows the selection** (amendment, decided
+  2026-09-29): the level probe resolves the selected TV source first and the
+  `AUDIOHUB_TV_SOURCE_PATTERN` substring only as factory default — same
+  rule as master volume. Without it, selecting a different capture would
+  leave the `tv/active` sensor measuring the UR23 while the TV path plays
+  elsewhere.
 
 Both operations run on the asyncio loop via the existing `AudioControl`
 connection, consistent with the threading model (the ducking engine keeps its
@@ -185,17 +199,26 @@ New state file (created on first user selection, never by the installer):
 ```
 
 Config files change only in that the hardcoded targets become clearly
-labelled bootstrap defaults; no format change.
+labelled bootstrap defaults; no format change. Additionally (amendment,
+decided 2026-09-29): `install.sh` templates the ducts' bootstrap target in
+the installed `50-ducts.conf` to the actual hardware when it can resolve
+the node (re-runs on an installed unit; the PipeWire stack is up). A fresh
+first-boot install keeps the repo default — the default-sink fallback
+covers boot, and the reconciler applies the factory default within seconds
+— so the §4.6 "declarative configs still route audio" guarantee holds on
+non-Pi-4B hardware too.
 
 ## 6. Code changes (by file)
 
 | File | Change |
 |---|---|
-| `hubd/main.py` | Device enumeration + prefix resolution helpers; two `select` entities in `_publish_discovery`; command handling for `output/set`, `tv_source/set`; reconciler step in the state-sync loop; `AudioControl.move_ducts_to_sink()` / `move_tv_capture_to_source()`; `_find_lineout` resolves the selected output before the `AUDIOHUB_LINEOUT_PATTERN` fallback. |
+| `hubd/main.py` | Device enumeration + prefix resolution helpers; two `select` entities in `_publish_discovery`; command handling for `output/set`, `tv_source/set`; reconciler step in the state-sync loop; `AudioControl.move_ducts_to_sink()` / `move_tv_capture_to_source()`; `_find_lineout` resolves the selected output before the `AUDIOHUB_LINEOUT_PATTERN` fallback; TV probe resolves the selected source. |
+| `install.sh` | Templates the installed `50-ducts.conf` bootstrap target to the resolved hardware sink (best effort — needs the user's PipeWire up; see §5). |
 | `unit.env.example` | Comments noting the keys are factory defaults overridden by `selection.json`. |
 | `docs/qa-disposition` follow-up | The duct hardcode finding (50-ducts.conf) is superseded by this spec once implemented. |
 | `README.md` | Architecture section: output/source selection via HA entities; drops the "specific hardware" caveat once verified. |
 | `scripts/validate.sh` | New check: both select entities present in discovery and reconciler active (hubd journal line). |
+| `tests/` | Unit tests for the prefix/option/resolution helpers, the selection store, discovery payloads, and simulated reconciler scenarios (fresh-boot idempotence, output move, absent-device hold, flip absorption, unattached-capture protection). |
 
 No systemd, installer, or PipeWire/WirePlumber config format changes are
 required. `pw-loopback` process spawning is explicitly *not* used — moves
@@ -218,6 +241,14 @@ Reproducible on a unit, per the disposition doc's methodology:
 5. Cold boot with nothing selected: zero move operations in the hubd journal
    (idempotence), graph identical to today.
 6. `selection.json` round-trip: rm the file → factory defaults reapply.
+7. (Amendment, decided 2026-09-29) PipeWire restart WITH a non-default
+   selection in effect: select the DAC, then
+   `systemctl --user restart pipewire wireplumber` — WirePlumber's
+   stream-restore can reattach the ducts to the stale target (the same
+   mechanism that once resurfaced stale ducked volumes); the reconciler
+   must move them back within one sync tick (≤ 2 s) and the published
+   state must not regress. This is a ROUTINE event now that release
+   updates restart the audio stack on every self-update.
 
 ## 8. Decision record
 
@@ -230,3 +261,13 @@ All open questions from the first draft were decided by the operator on
    S/PDIF-capability filtering.
 3. **BT speakers excluded from the output list** — accepted for this pass
    (§4.1). Ducking semantics and the single-stack guarantee stay wired-out.
+4. **TV Playing sensor probe follows the selected TV source** (found during
+   implementation prep: the probe resolved its target from the unit.env
+   pattern only) — accepted (§4.4). Same rule as decision 1.
+5. **Master control falls back to the pattern device while the selected
+   output is absent** — accepted (§4.4). Keeps IR/HA master volume alive
+   when the selected DAC is unplugged; routing state is held separately.
+6. **Installer templates the ducts' bootstrap target per hardware** —
+   accepted (§5). Closes the cold-boot portability gap that motivated the
+   spec: a fresh Pi 5 unit boots with working routing before any HA
+   interaction.

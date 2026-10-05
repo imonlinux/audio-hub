@@ -184,15 +184,61 @@ check_linger() {
 check_wifi() {
     echo ""
     echo "=== WiFi (optional) ==="
+    # unit.env is the source of truth; env override for ad-hoc runs
     local conn="${AUDIOHUB_WIFI_CONNECTION:-}"
+    if [ -z "$conn" ] && [ -r "$UNIT_ENV" ]; then
+        conn="$(grep -E '^AUDIOHUB_WIFI_CONNECTION=' "$UNIT_ENV" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' || true)"
+    fi
     if [ -z "$conn" ]; then
-        warn "AUDIOHUB_WIFI_CONNECTION not set; skipping"
-        return
+        echo "  (optional) AUDIOHUB_WIFI_CONNECTION not configured — skipping"
+        return 0
     fi
     if nmcli connection show "$conn" &>/dev/null; then
         pass "WiFi connection '$conn' present"
     else
-        warn "WiFi connection '$conn' not found"
+        warn "WiFi connection '$conn' not found (set in unit.env but no such NetworkManager connection)"
+    fi
+}
+
+check_updates() {
+    echo ""
+    echo "=== Release Updates ==="
+    local version auto
+    if [ -r /etc/audiohub/version ]; then
+        version="$(cat /etc/audiohub/version)"
+        pass "Deployed version stamped: $version"
+    else
+        warn "No version stamp at /etc/audiohub/version (development checkout?)"
+    fi
+    auto="$(grep -E '^AUDIOHUB_AUTO_UPDATE=' "$UNIT_ENV" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')"
+    auto="${auto:-true}"
+    if [ "$auto" != "true" ]; then
+        warn "Scheduled self-updates disabled (AUDIOHUB_AUTO_UPDATE=$auto)"
+        return 0
+    fi
+    if systemctl is-active audiohub-update.timer &>/dev/null; then
+        pass "audiohub-update.timer active (weekly release check)"
+    else
+        fail "AUDIOHUB_AUTO_UPDATE=$auto but audiohub-update.timer is not active — run the installer"
+    fi
+    if [ -x /usr/local/sbin/audiohub-update ]; then
+        pass "audiohub-update present (/usr/local/sbin)"
+    else
+        fail "audiohub-update missing — re-run the installer"
+    fi
+    if grep -q "your_password_here" "$UNIT_ENV" 2>/dev/null; then
+        fail "unit.env still has the placeholder MQTT password — set real credentials"
+    fi
+}
+
+check_selection() {
+    echo ""
+    echo "=== Device Selection ==="
+    if journalctl --user -u hubd.service --no-pager 2>/dev/null \
+        | grep -qi "selection reconciler active"; then
+        pass "Device-selection reconciler active"
+    else
+        fail "Selection reconciler not detected in the hubd journal (hubd build predates device selection?)"
     fi
 }
 
@@ -222,6 +268,8 @@ main() {
     check_services
     check_linger
     check_wifi
+    check_updates
+    check_selection
     print_summary
 }
 
