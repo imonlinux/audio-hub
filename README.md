@@ -73,7 +73,7 @@ Channels and per-unit settings live in `unit.env`:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `AUDIOHUB_AUTO_UPDATE` | `true` | `false` makes the weekly timer a no-op (manual runs still work) |
+| `AUDIOHUB_AUTO_UPDATE` | `false` | opt a unit in to scheduled self-updates; manual `sudo audiohub-update` always works |
 | `AUDIOHUB_RELEASE_CHANNEL` | `stable` | `stable` = promoted releases; `canary` = includes pre-releases |
 | `AUDIOHUB_RELEASE` | unset | Pin an exact tag — overrides the channel, and doubles as rollback |
 | `AUDIOHUB_UPDATE_REBOOT` | `false` | Reboot after a successful update instead of restarting services |

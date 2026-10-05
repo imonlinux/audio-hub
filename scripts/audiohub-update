@@ -87,6 +87,7 @@ resolve_release() { # resolve_release <stable|canary> -> tag on stdout
                     ;;
                 404)
                     # Nothing promoted yet — every release is still a pre-release
+                    log_warn "No stable release promoted yet; falling back to the newest (canary) release"
                     out="$(api_get "/releases?per_page=1")"; api_split "$out"
                     if [ "$API_CODE" != "200" ]; then
                         log_error "Cannot resolve channel '$channel' (GitHub API HTTP $API_CODE)"
@@ -135,9 +136,10 @@ fetch_and_verify() { # fetch_and_verify <tag> <workdir> -> extracted tree
 # Unit config + helpers
 # ---------------------------------------------------------------------------
 
-env_value() { # env_value <KEY> -> value (last assignment wins, quotes stripped)
+env_value() { # env_value <KEY> -> value (last assignment wins, surrounding quotes stripped)
     [ -r "$UNIT_ENV" ] || return 0
-    grep -E "^${1}=" "$UNIT_ENV" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' || true
+    grep -E "^${1}=" "$UNIT_ENV" 2>/dev/null | tail -1 | cut -d= -f2- \
+        | sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//' || true
 }
 
 hub_user() {
@@ -230,11 +232,12 @@ main() {
         exit 1
     fi
 
-    # Timer runs use --scheduled; units with auto-update disabled just exit
+    # Timer runs use --scheduled; units with auto-updates disabled just exit.
+    # Default is DISABLED: a self-updating appliance is opt-in per unit.
     if [ "$MODE" = "scheduled" ]; then
         local auto
         auto="$(env_value AUDIOHUB_AUTO_UPDATE)"
-        auto="${auto:-true}"
+        auto="${auto:-false}"
         if [ "$auto" != "true" ]; then
             echo "audiohub-update: auto-updates disabled (AUDIOHUB_AUTO_UPDATE=$auto); skipping"
             exit 0

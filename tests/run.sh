@@ -8,11 +8,12 @@
 # - test_device_selection.py / test_selection_reconcile.py: hubd device
 #   selection unit + integration tests (need .venv with pulsectl,
 #   paho-mqtt, evdev — the same system packages the Pi installs).
-set -u
+set -euo pipefail
 cd "$(dirname "$0")/.."
 rc=0
 for t in tests/release-logic.sh tests/update-flow.sh; do
     echo "### $t"
+    # pipefail: the harness's exit code must survive the tail pipe
     bash "$t" 2>/dev/null | tail -1 || rc=1
     echo
 done

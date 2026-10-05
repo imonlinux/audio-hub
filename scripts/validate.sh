@@ -265,12 +265,12 @@ main() {
     check_ur23
     check_bluetooth
     check_no_second_stack
-	check_services
-	check_linger
-	check_wifi
-	check_updates
-	check_selection
-	print_summary
+    check_services
+    check_linger
+    check_wifi
+    check_updates
+    check_selection
+    print_summary
 }
 
 main

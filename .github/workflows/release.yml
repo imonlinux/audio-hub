@@ -52,4 +52,5 @@ jobs:
           on GitHub and untick **Set as a pre-release**. Stable-channel units
           update themselves at the next weekly check." \
             dist/sha256sums.txt \
-            "dist/audio-hub-${GITHUB_REF_NAME}.tar.gz"
+            "dist/audio-hub-${GITHUB_REF_NAME}.tar.gz" \
+            "dist/audio-hub-${GITHUB_REF_NAME}.zip"

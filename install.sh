@@ -58,9 +58,14 @@ check_os() {
 }
 
 check_user() {
-    # Resolution order: explicit AUDIOHUB_USER, then the classic 'pi' login,
-    # then the first regular user (newer Raspberry Pi Imager flows create a
-    # named user instead of 'pi').
+    # Resolution order: explicit AUDIOHUB_USER env, then the value recorded
+    # in unit.env by a previous install (keeps manual re-runs on the same
+    # user as the release updater), then the classic 'pi' login, then the
+    # first regular user (newer Raspberry Pi Imager flows create a named
+    # user instead of 'pi').
+    if [ -z "${AUDIOHUB_USER:-}" ] && [ -r "$UNIT_ENV" ]; then
+        AUDIOHUB_USER="$(grep -E '^AUDIOHUB_USER=' "$UNIT_ENV" 2>/dev/null | tail -1 | cut -d= -f2- | sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//' || true)"
+    fi
     if [ -n "${AUDIOHUB_USER:-}" ]; then
         PI_USER="$AUDIOHUB_USER"
     elif id pi &>/dev/null; then
@@ -227,8 +232,15 @@ install_config() {
     # hubd's selection reconciler applies the factory default within
     # seconds of starting.
     local out_node
+    # Prefer the built-in ANALOG output: with HDMI sinks present, "first
+    # alsa_output" is registration-ordered and can be an HDMI node, which
+    # would make the cold-boot default inaudible until hubd reconciles.
     out_node="$(as_pi pactl list short sinks 2>/dev/null \
-        | awk '$2 ~ /^alsa_output\./ { print $2; exit }')"
+        | awk '$2 ~ /^alsa_output\./ && $2 ~ /(analog-stereo|stereo-fallback|mailbox)/ { print $2; exit }')"
+    if [ -z "$out_node" ]; then
+        out_node="$(as_pi pactl list short sinks 2>/dev/null \
+            | awk '$2 ~ /^alsa_output\./ { print $2; exit }')"
+    fi
     if [ -n "$out_node" ] \
         && ! grep -qF "$out_node" "$pw_dir/50-ducts.conf"; then
         sed -i "s|alsa_output\.platform-fe00b840\.mailbox\.stereo-fallback|$out_node|g" \
