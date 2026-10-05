@@ -35,7 +35,7 @@ jobs:
         run: |
           (cd dist && sha256sum "audio-hub-${GITHUB_REF_NAME}.tar.gz" \
                               "audio-hub-${GITHUB_REF_NAME}.zip" > sha256sums.txt)
-          cat sha256sums.txt
+          cat dist/sha256sums.txt
 
       - name: Create the pre-release
         env:
