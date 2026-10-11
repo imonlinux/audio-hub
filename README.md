@@ -25,7 +25,7 @@ Sendspin ──PIPEWIRE_NODE──▶ [bus.music] ──duct.music──▶
 - **Master volume/mute** = hardware sink
 - **Clock locked to 48 kHz** — matches TV S/PDIF output
 
-hubd (single daemon) does ducking (poll, 0.5 s), MQTT/Home Assistant entities, and FLIRC IR volume/mute.
+hubd (single daemon) does ducking (poll, 0.5 s), MQTT/Home Assistant entities, and FLIRC IR control. IR keys are mapped to actions by a persistent key-to-action map (`~/.config/audiohub/ir_map.json`): the three factory bindings (volume up/down, mute) work out of the box, every keypress is visible in HA via the "IR Last Key" sensor, and new keys are bound to actions from the HA UI through the IR Bind flow (hold-to-repeat is on by default for volume keys; `AUDIOHUB_IR_REPEAT=0` restores strict press-only).
 
 The **Output Device** and **TV Source** Home Assistant select entities route the graph at runtime (no config edits, no restarts): sources and the output are picked from what is actually plugged in, keyed by stable node-name prefixes, persisted in `~/.config/audiohub/selection.json`, and reconciled by hubd every 2 s. Bluetooth and Sendspin stay name-routed by their own connection lifecycle and are never selectable. See `docs/device-selection-spec.md`.
 
