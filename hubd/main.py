@@ -57,6 +57,21 @@ logging.basicConfig(
 )
 log = logging.getLogger("hubd")
 
+# Installed-version source for HA discovery (sw_version / origin block). Read
+# defensively: a missing file (development machines, tests) reports "dev".
+AUDIOHUB_VERSION_PATH = "/etc/audiohub/version"
+
+
+def audiohub_version() -> str:
+    try:
+        with open(AUDIOHUB_VERSION_PATH) as f:
+            version = f.read().strip()
+        if version:
+            return version
+    except Exception:
+        pass
+    return "dev"
+
 
 # -----------------------------------------------------------------------------
 # Configuration
@@ -108,6 +123,15 @@ class HubConfig:
     # Hold-to-repeat: EV_KEY value-2 auto-repeat events step volume (only)
     # while the button is held. False restores strict press-only behavior.
     ir_repeat: bool = True
+    # Minimum spacing between dispatched auto-repeat steps per key, in
+    # milliseconds (the kernel delivers value-2 events at ~30 Hz).
+    ir_repeat_interval_ms: int = 150
+
+    # Update preferences (Section 4.7). unit.env is the fleet default;
+    # both are overridden at runtime from Home Assistant (settings.json)
+    # and read back from there by the root updater.
+    auto_update: bool = False
+    release_channel: str = "stable"
 
     @classmethod
     def from_env(cls, path: str = "/etc/audiohub/unit.env") -> "HubConfig":
@@ -153,6 +177,9 @@ class HubConfig:
             ir_device_path=props.get("AUDIOHUB_IR_DEVICE", "/dev/input/by-id/usb-flirc.tv_flirc_*-event-kbd"),
             ir_volume_step=get_float("AUDIOHUB_IR_VOLUME_STEP", 0.03),
             ir_repeat=get_bool("AUDIOHUB_IR_REPEAT", True),
+            ir_repeat_interval_ms=int(get_float("AUDIOHUB_IR_REPEAT_INTERVAL", 150)),
+            auto_update=get_bool("AUDIOHUB_AUTO_UPDATE", False),
+            release_channel=props.get("AUDIOHUB_RELEASE_CHANNEL", "stable"),
         )
 
 
@@ -283,6 +310,139 @@ class SelectionStore:
             # Selection stays effective for this session; the store is
             # re-created on the next accepted command.
             log.warning(f"Could not persist selection store: {e}")
+
+
+# -----------------------------------------------------------------------------
+# Runtime Settings
+# -----------------------------------------------------------------------------
+# Runtime-adjustable settings (spec Section 4.2), edited from Home Assistant
+# and persisted to ~/.config/audiohub/settings.json. Precedence per key:
+# settings.json (values the user changed) > unit.env fleet default > built-in
+# default. unit.env and the built-in default both live in HubConfig, so the
+# fall-through is a plain attribute read.
+
+SETTING_DEFS = {
+    # key: kind + validation surface. "percent" is stored 0.0-1.0 and
+    # travels over MQTT as 0-100.
+    "ducking_enabled":       {"kind": "bool"},
+    "duck_level":            {"kind": "percent", "min": 0.0, "max": 1.0},
+    "duck_restore_delay":    {"kind": "float", "min": 0.0, "max": 30.0},
+    "ir_volume_step":        {"kind": "percent", "min": 0.01, "max": 0.10},
+    "ir_repeat":             {"kind": "bool"},
+    "ir_repeat_interval_ms": {"kind": "int", "min": 100, "max": 1000},
+    "tv_probe_threshold":    {"kind": "float", "min": 10.0, "max": 5000.0},
+    "tv_probe_interval":     {"kind": "float", "min": 2.0, "max": 60.0},
+    "auto_update":           {"kind": "bool"},
+    "release_channel":       {"kind": "select", "options": ("stable", "canary")},
+}
+# Percent-kind settings: MQTT payload = stored value * 100.
+SETTING_MQTT_PERCENT = ("duck_level", "ir_volume_step")
+
+
+def _clamp(value, lo, hi):
+    return max(lo, min(hi, value))
+
+
+class SettingsStore:
+    """Runtime settings, modelled on SelectionStore: atomic persist
+    (`.tmp` + os.replace), thread-safe (the ducking thread reads duck level
+    and release delay each poll). The file holds only keys changed from HA;
+    absent keys fall through to the HubConfig bootstrap value, keeping
+    unit.env meaningful as the fleet default and making Reset a value wipe."""
+
+    def __init__(self, config: HubConfig, path: "str | None" = None):
+        self.cfg = config
+        self.path = path or os.path.expanduser(
+            os.path.join("~", ".config", "audiohub", "settings.json"))
+        self._lock = threading.Lock()
+        self._values: dict = {}
+        self._load()
+
+    def _coerce(self, key: str, value):
+        """Validate/clamp one value against its definition. Returns the
+        normalized value, or None when it is unusable."""
+        d = SETTING_DEFS[key]
+        kind = d["kind"]
+        try:
+            if kind == "bool":
+                return bool(value)
+            if kind in ("percent", "float"):
+                return _clamp(float(value), d["min"], d["max"])
+            if kind == "int":
+                return int(_clamp(float(value), d["min"], d["max"]))
+            if kind == "select":
+                return value if value in d["options"] else None
+        except (TypeError, ValueError):
+            pass
+        return None
+
+    def _load(self):
+        try:
+            with open(self.path) as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return
+        except Exception as e:
+            log.warning(f"Ignoring unreadable settings store {self.path}: {e}")
+            return
+        values = data.get("values") if isinstance(data, dict) else None
+        if not isinstance(values, dict):
+            log.warning(f"Ignoring malformed settings store {self.path}")
+            return
+        with self._lock:
+            for key, value in values.items():
+                if key not in SETTING_DEFS:
+                    log.warning(f"Settings: dropping unknown key {key!r}")
+                    continue
+                v = self._coerce(key, value)
+                if v is None:
+                    log.warning(
+                        f"Settings: dropping {key!r}: invalid value {value!r}")
+                    continue
+                self._values[key] = v
+
+    def get(self, key: str):
+        """Resolve the precedence chain: user override, else the bootstrap
+        value (unit.env entry, else the built-in default)."""
+        with self._lock:
+            if key in self._values:
+                return self._values[key]
+        return getattr(self.cfg, key)
+
+    def set(self, key: str, value):
+        """Store a user override (validated and clamped). Raises ValueError
+        when no coercion can rescue the value (e.g. a bad select option).
+        Returns the stored (normalized) value."""
+        v = self._coerce(key, value)
+        if v is None:
+            raise ValueError(f"invalid value for {key}: {value!r}")
+        with self._lock:
+            self._values[key] = v
+            snapshot = dict(self._values)
+        self._persist(snapshot)
+        return v
+
+    def overrides(self) -> dict:
+        with self._lock:
+            return dict(self._values)
+
+    def reset(self):
+        """Wipe all user overrides; every setting falls through to the
+        bootstrap value."""
+        with self._lock:
+            self._values = {}
+        self._persist({})
+
+    def _persist(self, snapshot: dict):
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"version": 1, "values": snapshot}, f,
+                          indent=2, sort_keys=True)
+            os.replace(tmp, self.path)
+        except Exception as e:
+            log.warning(f"Could not persist settings store: {e}")
 
 
 # -----------------------------------------------------------------------------
@@ -443,11 +603,13 @@ class DuckingEngine:
 
     def __init__(self, config: HubConfig, loop: asyncio.AbstractEventLoop,
                  stop_event: threading.Event,
-                 selection: "SelectionStore | None" = None):
+                 selection: "SelectionStore | None" = None,
+                 settings: "SettingsStore | None" = None):
         self.cfg = config
         self.loop = loop
         self.stop_event = stop_event
         self.selection = selection
+        self.settings = settings
         self.ducking_enabled = config.ducking_enabled
         self.is_ducked = False
         self._pending_enable: bool | None = None
@@ -471,6 +633,15 @@ class DuckingEngine:
     def on_change(self, callback):
         """Register callback(state: dict), invoked on the asyncio loop."""
         self._on_change = callback
+
+    def _setting(self, key: str):
+        """Runtime setting with bootstrap fall-through: the settings store
+        when one is attached, else the unit.env / built-in value. Called on
+        the ducking thread each poll, so live HA changes apply within one
+        poll interval."""
+        if self.settings is not None:
+            return self.settings.get(key)
+        return getattr(self.cfg, key)
 
     def set_enabled(self, enabled: bool):
         """Request enable/disable ducking (thread-safe; applied by the engine
@@ -545,7 +716,7 @@ class DuckingEngine:
         state can restore stale values onto the recreated duct streams at
         boot (observed: June-era ducked volumes resurfacing after reboot).
         The poll loop compares actual vs expected and corrects drift."""
-        expected = self._cubic(self.cfg.duck_level if self.is_ducked else 1.0)
+        expected = self._cubic(self._setting("duck_level") if self.is_ducked else 1.0)
         try:
             for si in self._pulse.sink_input_list():
                 node = si.proplist.get("node.name", "")
@@ -638,7 +809,7 @@ class DuckingEngine:
         now = time.monotonic()
         if self._tv_probe_at is not None and now < self._tv_probe_at:
             return self._tv_cached or now < self._tv_hold_until
-        self._tv_probe_at = now + self.cfg.tv_probe_interval
+        self._tv_probe_at = now + self._setting("tv_probe_interval")
         on = self._probe_tv_level()
         if on:
             self._tv_hold_until = now + self.cfg.tv_sensor_hold
@@ -682,7 +853,7 @@ class DuckingEngine:
                 return False
             samples = struct.unpack(f"<{len(data) // 2}h", data)
             rms = (sum(x * x for x in samples[::4]) / max(1, len(samples) // 4)) ** 0.5
-            return rms > self.cfg.tv_probe_threshold
+            return rms > self._setting("tv_probe_threshold")
         except Exception as e:
             log.debug(f"tv level probe failed: {e}")
             return False
@@ -720,7 +891,7 @@ class DuckingEngine:
         """Apply duck/restore to the duct streams. If no duct streams exist
         yet (graph still assembling), leave state unchanged and retry on the
         next poll."""
-        level = self.cfg.duck_level if ducked else 1.0
+        level = self._setting("duck_level") if ducked else 1.0
         targets = self._set_duct_level(level)
         if not targets:
             log.debug(f"No duct targets present yet for duck={ducked}; will retry")
@@ -744,7 +915,7 @@ class DuckingEngine:
             now = time.monotonic()
             if self._inactive_since is None:
                 self._inactive_since = now
-            elif now - self._inactive_since >= self.cfg.duck_restore_delay:
+            elif now - self._inactive_since >= self._setting("duck_restore_delay"):
                 self._apply(False)
                 self._inactive_since = None
 
@@ -791,14 +962,19 @@ class MQTTBridge:
         {id}/volume/set              master volume        (0.0 - 1.0)
         {id}/{tv|bt|music}/volume/set  per-source volume  (0.0 - 1.0)
         {id}/mute/set                master mute          (ON/OFF)
-        {id}/ducking/set             ducking enable       (ON/OFF)
+        {id}/ducking/set             ducking enable       (ON/OFF, persisted)
+        {id}/setting/{key}/set       runtime setting (Section 4.3; key
+                                     "reset" = Reset Settings button)
+        {id}/output/set, {id}/tv_source/set   device selection
         {id}/ir/{KEY}/set            action for a bound IR key
         {id}/ir_bind/choose/set      bind-flow target action
         {id}/ir_bind/arm/set         bind-flow arm button (PRESS)
-        {id}/volume/state, {id}/{source}/volume/state, ...  state (retained)
+        {id}/volume/state, {id}/{source}/volume/state, ...
+        {id}/setting/{key}/state     state (retained)
     """
 
-    def __init__(self, config: HubConfig, ir_map: "IRMapStore | None" = None):
+    def __init__(self, config: HubConfig, ir_map: "IRMapStore | None" = None,
+                 settings: "SettingsStore | None" = None):
         self.cfg = config
         self.client: mqtt.Client | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -806,12 +982,14 @@ class MQTTBridge:
         self._mute_callback = None
         self._ducking_callback = None
         self._selection_callback = None
+        self._setting_callback = None
         self._ir_key_callback = None
         self._ir_bind_choose_callback = None
         self._ir_bind_arm_callback = None
         self._state_provider = None
         self._selection_provider = None
         self._ir_map = ir_map
+        self.settings = settings
         self._ir_bind_chosen: str | None = IR_BIND_ACTIONS[0]
         # Last known select options; updated by publish_selection_discovery.
         self._selection_options: dict = {"output": [], "tv_source": []}
@@ -831,6 +1009,11 @@ class MQTTBridge:
     def on_selection_command(self, callback):
         """Register callback(key: 'output'|'tv_source', option: str)."""
         self._selection_callback = callback
+
+    def on_setting_command(self, callback):
+        """Register callback(key: str, payload: str) for {id}/setting/{key}/set
+        (key 'reset' carries the Reset Settings button press)."""
+        self._setting_callback = callback
 
     def on_ir_key_command(self, callback):
         """Register callback(key_name: str, action: str) for {id}/ir/{KEY}/set."""
@@ -856,6 +1039,19 @@ class MQTTBridge:
 
     def _availability_topic(self) -> str:
         return f"{self.cfg.mqtt_base_topic}/sensor/{self.cfg.device_id}_availability/state"
+
+    def _device_block(self) -> dict:
+        """Shared HA device registry block (was three inline copies)."""
+        return {
+            "identifiers": [self.cfg.device_id],
+            "name": self.cfg.device_name,
+            "model": "Raspberry Pi 4B",
+            "manufacturer": "Custom Audio Hub",
+            "sw_version": audiohub_version(),
+        }
+
+    def _origin(self) -> dict:
+        return {"name": "audio-hub", "sw": audiohub_version()}
 
     async def run(self, stop_event: threading.Event):
         """Run the MQTT client until stop_event is set."""
@@ -923,6 +1119,7 @@ class MQTTBridge:
         client.subscribe(f"{self.cfg.device_id}/ducking/set")
         client.subscribe(f"{self.cfg.device_id}/output/set")
         client.subscribe(f"{self.cfg.device_id}/tv_source/set")
+        client.subscribe(f"{self.cfg.device_id}/setting/+/set")
         client.subscribe(f"{self.cfg.device_id}/ir/+/set")
         client.subscribe(f"{self.cfg.device_id}/ir_bind/choose/set")
         client.subscribe(f"{self.cfg.device_id}/ir_bind/arm/set")
@@ -976,6 +1173,10 @@ class MQTTBridge:
                     and parts[2] == "set":
                 if payload == "PRESS" and self._ir_bind_arm_callback is not None:
                     self._emit(lambda: self._ir_bind_arm_callback())
+            # {id}/setting/{key}/set -> runtime setting ("reset" = Reset button)
+            elif len(parts) == 3 and parts[0] == "setting" and parts[2] == "set":
+                if self._setting_callback is not None:
+                    self._emit(lambda: self._setting_callback(parts[1], payload))
             # {id}/volume/set | {id}/mute/set | {id}/ducking/set
             elif len(parts) == 2 and parts[1] == "set":
                 cmd = parts[0]
@@ -1014,12 +1215,7 @@ class MQTTBridge:
         base = self.cfg.mqtt_base_topic
         dev_id = self.cfg.device_id
         availability = self._availability_topic()
-        device = {
-            "identifiers": [dev_id],
-            "name": self.cfg.device_name,
-            "model": "Raspberry Pi 4B",
-            "manufacturer": "Custom Audio Hub",
-        }
+        device = self._device_block()
         entities = []
 
         def add(component: str, slug: str, payload: dict):
@@ -1095,15 +1291,33 @@ class MQTTBridge:
                 "state_topic": f"{dev_id}/{key}/active",
                 "payload_on": "ON",
                 "payload_off": "OFF",
+                "entity_category": "diagnostic",
                 "availability_topic": availability,
                 "icon": icon,
                 "device": device,
             })
 
+        # Hub Availability mirrors the LWT topic itself. It deliberately
+        # carries no availability_topic of its own: the entity must stay
+        # registered to report "offline".
+        add("binary_sensor", "hub_availability", {
+            "name": "Hub Availability",
+            "unique_id": f"{dev_id}_hub_availability",
+            "state_topic": availability,
+            "payload_on": "online",
+            "payload_off": "offline",
+            "entity_category": "diagnostic",
+            "icon": "mdi:server-network",
+            "device": device,
+        })
+
         entities.extend(self._selection_discovery(base, dev_id, availability, device))
         entities.extend(self._ir_discovery(base, dev_id, availability, device))
+        if self.settings is not None:
+            entities.extend(self._settings_discovery(base, dev_id, availability, device))
 
         for topic, payload in entities:
+            payload["origin"] = self._origin()
             client.publish(topic, json.dumps(payload), retain=True)
 
         log.info(f"Published {len(entities)} discovery entities")
@@ -1201,11 +1415,100 @@ class MQTTBridge:
                     "state_topic": f"{dev_id}/{key}/state",
                     "command_topic": f"{dev_id}/{key}/set",
                     "options": self._selection_options.get(key, []),
+                    "entity_category": "config",
                     "availability_topic": availability,
                     "icon": icon,
                     "device": device,
                 },
             ))
+        return entities
+
+    def _settings_discovery(self, base: str, dev_id: str, availability: str,
+                            device: dict) -> list:
+        """HA payloads for the runtime-settings entities (spec Section 4.3).
+        Percent-kind settings travel 0-100 natively (no value template);
+        storage stays 0.0-1.0."""
+        entities = []
+
+        def add_setting(component: str, key: str, name: str, icon: str,
+                        extra: dict, *, enabled: bool = True):
+            entities.append((
+                f"{base}/{component}/{dev_id}_setting_{key}/config",
+                {
+                    "name": name,
+                    "unique_id": f"{dev_id}_setting_{key}",
+                    "state_topic": f"{dev_id}/setting/{key}/state",
+                    "command_topic": f"{dev_id}/setting/{key}/set",
+                    "entity_category": "config",
+                    "enabled_by_default": enabled,
+                    "availability_topic": availability,
+                    "icon": icon,
+                    "device": device,
+                    **extra,
+                },
+            ))
+
+        add_setting("number", "duck_level", "Duck Level",
+                    "mdi:arrow-collapse-down", {
+                        "min": 0, "max": 100, "step": 5,
+                        "unit_of_measurement": "%", "mode": "slider",
+                    })
+        add_setting("number", "duck_restore_delay", "Duck Release Delay",
+                    "mdi:timer", {
+                        "min": 0, "max": 30, "step": 0.5,
+                        "unit_of_measurement": "s", "mode": "box",
+                    })
+        add_setting("number", "ir_volume_step", "IR Volume Step",
+                    "mdi:volume-plus", {
+                        "min": 1, "max": 10, "step": 1,
+                        "unit_of_measurement": "%", "mode": "slider",
+                    })
+        add_setting("switch", "ir_repeat", "IR Hold-to-Repeat",
+                    "mdi:repeat", {})
+        add_setting("number", "ir_repeat_interval_ms", "IR Repeat Interval",
+                    "mdi:timer-outline", {
+                        "min": 100, "max": 1000, "step": 50,
+                        "unit_of_measurement": "ms", "mode": "box",
+                    }, enabled=False)
+        add_setting("number", "tv_probe_threshold", "TV Detection Threshold",
+                    "mdi:waveform", {
+                        "min": 10, "max": 5000, "step": 10, "mode": "box",
+                    }, enabled=False)
+        add_setting("number", "tv_probe_interval", "TV Detection Interval",
+                    "mdi:timer-sand", {
+                        "min": 2, "max": 60, "step": 0.5,
+                        "unit_of_measurement": "s", "mode": "box",
+                    }, enabled=False)
+        add_setting("switch", "auto_update", "Auto Update",
+                    "mdi:cellphone-arrow-down", {})
+        entities.append((
+            f"{base}/select/{dev_id}_setting_release_channel/config",
+            {
+                "name": "Release Channel",
+                "unique_id": f"{dev_id}_setting_release_channel",
+                "state_topic": f"{dev_id}/setting/release_channel/state",
+                "command_topic": f"{dev_id}/setting/release_channel/set",
+                "options": list(SETTING_DEFS["release_channel"]["options"]),
+                "entity_category": "config",
+                "availability_topic": availability,
+                "icon": "mdi:tag-outline",
+                "device": device,
+            },
+        ))
+        entities.append((
+            f"{base}/button/{dev_id}_setting_reset/config",
+            {
+                "name": "Reset Settings",
+                "unique_id": f"{dev_id}_setting_reset",
+                "command_topic": f"{dev_id}/setting/reset/set",
+                "payload_press": "PRESS",
+                "entity_category": "config",
+                "enabled_by_default": False,
+                "availability_topic": availability,
+                "icon": "mdi:restore",
+                "device": device,
+            },
+        ))
         return entities
 
     def publish_selection_discovery(self, options: dict):
@@ -1221,13 +1524,9 @@ class MQTTBridge:
         base = self.cfg.mqtt_base_topic
         dev_id = self.cfg.device_id
         availability = self._availability_topic()
-        device = {
-            "identifiers": [dev_id],
-            "name": self.cfg.device_name,
-            "model": "Raspberry Pi 4B",
-            "manufacturer": "Custom Audio Hub",
-        }
+        device = self._device_block()
         for topic, payload in self._selection_discovery(base, dev_id, availability, device):
+            payload["origin"] = self._origin()
             self._publish(topic, json.dumps(payload))
 
     # -- state publishing (asyncio loop thread) ---------------------------------
@@ -1256,6 +1555,9 @@ class MQTTBridge:
                     self.publish_selection_state(key, sel.get("effective", {}).get(key))
             except Exception as e:
                 log.warning(f"Could not publish selection state: {e}")
+        if self.settings is not None:
+            for key in SETTING_DEFS:
+                self.publish_setting_state(key, self.settings.get(key))
         if self._ir_map is not None:
             for key_name, action in sorted(self._ir_map.snapshot().items()):
                 self.publish_ir_key_state(key_name, action)
@@ -1287,6 +1589,19 @@ class MQTTBridge:
             return
         self._publish(f"{self.cfg.device_id}/{key}/state", option)
 
+    def publish_setting_state(self, key: str, value):
+        """Echo a setting on {id}/setting/{key}/state. Percent-kind settings
+        travel 0-100 (Section 4.3); storage stays 0.0-1.0."""
+        if key in SETTING_MQTT_PERCENT:
+            payload = str(int(round(value * 100)))
+        elif isinstance(value, bool):
+            payload = "ON" if value else "OFF"
+        elif isinstance(value, float):
+            payload = f"{value:g}"
+        else:
+            payload = str(value)
+        self._publish(f"{self.cfg.device_id}/setting/{key}/state", payload)
+
     # -- IR state publishing (asyncio loop thread) -------------------------------
     def publish_ir_key_state(self, key_name: str, action: str):
         self._publish(f"{self.cfg.device_id}/ir/{key_name}/state", action)
@@ -1309,14 +1624,10 @@ class MQTTBridge:
         base = self.cfg.mqtt_base_topic
         dev_id = self.cfg.device_id
         availability = self._availability_topic()
-        device = {
-            "identifiers": [dev_id],
-            "name": self.cfg.device_name,
-            "model": "Raspberry Pi 4B",
-            "manufacturer": "Custom Audio Hub",
-        }
+        device = self._device_block()
         topic, payload = self._ir_key_entity(
             key_name, base, dev_id, availability, device)
+        payload["origin"] = self._origin()
         self._publish(topic, json.dumps(payload))
 
     def _publish(self, topic: str, payload: str):
@@ -1646,7 +1957,8 @@ class HubDaemon:
         self.cfg = config
         self.stop_event = threading.Event()
         self.ir_map = IRMapStore()
-        self.mqtt = MQTTBridge(config, self.ir_map)
+        self.settings = SettingsStore(config)
+        self.mqtt = MQTTBridge(config, self.ir_map, self.settings)
         self.selection = SelectionStore()
         self.audio = AudioControl(config, self.selection)
         self.ir = IRHandler(config, self.stop_event)
@@ -1656,12 +1968,14 @@ class HubDaemon:
         self._sel_options: dict = {"output": [], "tv_source": []}
         self._sel_effective: dict = {"output": None, "tv_source": None}
         # IR state: first-sighting dedup for unmapped keys, the armed bind
-        # window, the action currently chosen in the HA bind select, and a
-        # generation counter guarding the delayed return-to-idle publish.
+        # window, the action currently chosen in the HA bind select, a
+        # generation counter guarding the delayed return-to-idle publish,
+        # and per-key last-repeat timestamps for the rate limiter (5.4).
         self._ir_unmapped_seen: set[str] = set()
         self._ir_bind: "dict | None" = None
         self._ir_bind_chosen: str = IR_BIND_ACTIONS[0]
         self._ir_status_generation = 0
+        self._ir_last_repeat: dict[str, float] = {}
 
         # MQTT command handlers (run on the asyncio loop)
         self.mqtt.on_volume_command("tv", self._on_tv_volume)
@@ -1671,6 +1985,7 @@ class HubDaemon:
         self.mqtt.on_mute_command(self._on_mute_command)
         self.mqtt.on_ducking_command(self._on_ducking_command)
         self.mqtt.on_selection_command(self._on_selection_command)
+        self.mqtt.on_setting_command(self._on_setting_command)
         self.mqtt.on_ir_key_command(self._on_ir_key_command)
         self.mqtt.on_ir_bind_choose(self._on_ir_bind_choose)
         self.mqtt.on_ir_bind_arm(self._on_ir_bind_arm)
@@ -1703,9 +2018,60 @@ class HubDaemon:
 
     def _on_ducking_command(self, enabled: bool):
         log.info(f"Ducking enable command: {enabled}")
+        # Persisted so the switch survives restarts (spec Section 4.3);
+        # unit.env remains the fleet default until changed from HA.
+        self.settings.set("ducking_enabled", enabled)
         if self.ducking is not None:
             self.ducking.set_enabled(enabled)
             # State is published when the engine applies it (_on_hub_state).
+
+    def _on_setting_command(self, key: str, payload: str):
+        """HA command for a runtime setting, or the Reset Settings button
+        (key 'reset'). Invalid commands are logged and ignored; accepted
+        values are clamped, persisted, applied live, and echoed on the
+        state topic (spec Section 4.3)."""
+        if key == "reset":
+            if payload == "PRESS":
+                self._reset_settings()
+            return
+        if key not in SETTING_DEFS:
+            log.warning(f"Ignoring unknown setting {key!r}")
+            return
+        kind = SETTING_DEFS[key]["kind"]
+        try:
+            if kind == "bool":
+                value = payload.upper() in ("ON", "1", "TRUE", "YES")
+            elif kind == "percent":
+                value = float(payload) / 100.0
+            elif kind == "int":
+                value = int(float(payload))
+            else:
+                value = payload
+            stored = self.settings.set(key, value)
+        except (ValueError, TypeError) as e:
+            log.warning(f"Ignoring invalid {key} command {payload!r}: {e}")
+            return
+        self._apply_setting(key, stored)
+        self.mqtt.publish_setting_state(key, stored)
+        log.info(f"Setting {key} -> {stored}")
+
+    def _apply_setting(self, key: str, value):
+        """Live-apply an accepted setting. The ducking engine reads duck
+        level / release delay / TV probe values from the store every poll,
+        so only the enable flag needs explicit forwarding here."""
+        if key == "ducking_enabled" and self.ducking is not None:
+            self.ducking.set_enabled(value)
+
+    def _reset_settings(self):
+        """Reset Settings button: wipe user overrides, re-apply, and
+        re-publish every setting from its fall-through value. IR mappings
+        and device selections are untouched."""
+        self.settings.reset()
+        if self.ducking is not None:
+            self.ducking.set_enabled(self.settings.get("ducking_enabled"))
+        for key in SETTING_DEFS:
+            self.mqtt.publish_setting_state(key, self.settings.get(key))
+        log.info("Settings reset to unit.env / built-in defaults")
 
     def _on_selection_command(self, key: str, payload: str):
         """Output Device / TV Source select command from HA."""
@@ -1727,12 +2093,21 @@ class HubDaemon:
         map lookup, repeat gating, unmapped-key logging, dispatch."""
         if is_repeat:
             # Auto-repeat fires only volume actions, only when enabled, and
-            # never during an armed bind window (5.4 / 5.6).
+            # never during an armed bind window (5.4 / 5.6). Rate-limited
+            # per key: the kernel delivers value-2 events at ~30 Hz; only
+            # one step per ir_repeat_interval_ms is dispatched. Repeat
+            # steps stay off MQTT (the 2 s state sync publishes the final
+            # value); a real press still publishes immediately.
             if self._ir_bind is not None:
                 return
             action = self.ir_map.get(key_name)
-            if action in IR_REPEATABLE and self.cfg.ir_repeat:
-                self._ir_dispatch(action)
+            if action in IR_REPEATABLE and self.settings.get("ir_repeat"):
+                now = time.monotonic()
+                interval_s = self.settings.get("ir_repeat_interval_ms") / 1000.0
+                if now - self._ir_last_repeat.get(key_name, 0.0) < interval_s:
+                    return
+                self._ir_last_repeat[key_name] = now
+                self._ir_dispatch(action, publish=False)
             return
         # Real press: observable regardless of mapping; capture wins over
         # dispatch so the binding press never fires its own action.
@@ -1749,11 +2124,11 @@ class HubDaemon:
             return
         self._ir_dispatch(action)
 
-    def _ir_dispatch(self, action: str):
+    def _ir_dispatch(self, action: str, publish: bool = True):
         if action == "volume_up":
-            self._ir_step(+1)
+            self._ir_step(+1, publish)
         elif action == "volume_down":
-            self._ir_step(-1)
+            self._ir_step(-1, publish)
         elif action == "mute_toggle":
             self._ir_mute()
         elif action == "ducking_toggle":
@@ -1836,13 +2211,15 @@ class HubDaemon:
         if bind is not None and time.monotonic() >= bind["deadline"]:
             self._ir_bind_expire()
 
-    def _ir_step(self, sign: int):
+    def _ir_step(self, sign: int, publish: bool = True):
         current = self.audio.get_lineout_volume()
         if current is None:
             return
-        new = min(1.0, max(0.0, current + sign * self.cfg.ir_volume_step))
+        step = self.settings.get("ir_volume_step")
+        new = min(1.0, max(0.0, current + sign * step))
         self.audio.set_lineout_volume(new)
-        self.mqtt.publish_volume("master", new)
+        if publish:
+            self.mqtt.publish_volume("master", new)
         log.info(f"IR volume: {current:.2f} -> {new:.2f}")
 
     def _ir_mute(self):
@@ -1979,7 +2356,8 @@ class HubDaemon:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, self._request_stop)
 
-        self.ducking = DuckingEngine(self.cfg, loop, self.stop_event, self.selection)
+        self.ducking = DuckingEngine(self.cfg, loop, self.stop_event,
+                                     self.selection, self.settings)
         self.ducking.on_change(self._on_hub_state)
         # The IR worker thread dispatches keypresses onto this loop; without
         # this the handler logs keys but silently drops them.
@@ -2012,7 +2390,8 @@ def main():
         default=os.environ.get("AUDIOHUB_CONFIG", "/etc/audiohub/unit.env"),
         help="Path to unit configuration file",
     )
-    parser.add_argument("--version", action="version", version="%(prog)s 1.0.0")
+    parser.add_argument("--version", action="version",
+                        version="%(prog)s " + audiohub_version())
     args = parser.parse_args()
 
     try:

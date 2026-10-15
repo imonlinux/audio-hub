@@ -5,8 +5,7 @@
 # - release-logic.sh / update-flow.sh: bash harnesses for the bootstrap and
 #   self-update machinery (GitHub API and downloads mocked; no network,
 #   no root).
-# - test_device_selection.py / test_selection_reconcile.py: hubd device
-#   selection unit + integration tests (need .venv with pulsectl,
+# - test_*.py: hubd unit + integration tests (need .venv with pulsectl,
 #   paho-mqtt, evdev — the same system packages the Pi installs).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -18,7 +17,8 @@ for t in tests/release-logic.sh tests/update-flow.sh; do
     echo
 done
 if [ -x .venv/bin/python ]; then
-    for t in tests/test_device_selection.py tests/test_selection_reconcile.py; do
+    for t in tests/test_device_selection.py tests/test_selection_reconcile.py \
+             tests/test_ir_mapping.py tests/test_settings.py; do
         echo "### $t"
         .venv/bin/python "$t" 2>&1 | tail -1 || rc=1
         echo
