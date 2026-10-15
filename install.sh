@@ -327,12 +327,29 @@ install_services() {
     install -m 644 "$REPO_DIR/systemd/system/wifi-powersave-off.service" /etc/systemd/system/
     install -m 755 "$REPO_DIR/scripts/bluetooth-setup.sh" /usr/local/sbin/bluetooth-setup.sh
 
-    # Release updater: script + weekly timer. The timer is enabled for every
-    # unit; AUDIOHUB_AUTO_UPDATE=false in unit.env makes the scheduled run a
-    # no-op (manual 'sudo audiohub-update' always works).
+    # Release updater: script + weekly timer + the HA update entity plumbing
+    # (spec Section 4.7): a path unit that applies hubd's install requests as
+    # root, and a daily availability check feeding the HA Firmware entity.
+    # The weekly timer is enabled for every unit; AUDIOHUB_AUTO_UPDATE=false
+    # in unit.env makes the scheduled run a no-op (manual
+    # 'sudo audiohub-update' and the HA Install button always work).
     install -m 755 "$REPO_DIR/scripts/audiohub-update" /usr/local/sbin/audiohub-update
     install -m 644 "$REPO_DIR/systemd/system/audiohub-update.service" /etc/systemd/system/
     install -m 644 "$REPO_DIR/systemd/system/audiohub-update.timer" /etc/systemd/system/
+    install -m 644 "$REPO_DIR/systemd/system/audiohub-update-request.path" /etc/systemd/system/
+    install -m 644 "$REPO_DIR/systemd/system/audiohub-update-request.service" /etc/systemd/system/
+    install -m 644 "$REPO_DIR/systemd/system/audiohub-update-check.service" /etc/systemd/system/
+    install -m 644 "$REPO_DIR/systemd/system/audiohub-update-check.timer" /etc/systemd/system/
+
+    # Request/status directory for the HA update entity: hubd writes request
+    # files there, the root path unit consumes them. Re-created at every
+    # boot by tmpfiles (0755, owned by the hub user).
+    echo "d /run/audiohub 0755 $PI_USER $PI_USER" > /etc/tmpfiles.d/audiohub.conf
+    systemd-tmpfiles --create /etc/tmpfiles.d/audiohub.conf
+
+    # Root tools (the updater) locate the hub user's settings.json via this
+    # file; AUDIOHUB_USER in unit.env remains the explicit override.
+    echo "$PI_USER" > "$CONFIG_DIR/hub-user"
 
     # User services
     local user_dir="$PI_HOME/.config/systemd/user"
@@ -348,6 +365,8 @@ install_services() {
     systemctl enable --now bluetooth-setup.service
     systemctl enable --now wifi-powersave-off.service
     systemctl enable --now audiohub-update.timer
+    systemctl enable --now audiohub-update-request.path
+    systemctl enable --now audiohub-update-check.timer
 
     # User services: enabled inside the hub user's manager
     if [ -d "/run/user/$PI_UID" ]; then

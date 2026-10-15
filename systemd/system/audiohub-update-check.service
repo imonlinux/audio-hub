@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily Audio Hub update availability check
+Documentation=https://github.com/imonlinux/audio-hub#updating
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# --check resolves the channel and compares only; the status file it writes
+# (no request token) is what the HA Firmware update entity publishes.
+ExecStart=/usr/local/sbin/audiohub-update --check --status-file /run/audiohub/update-status.json
+TimeoutStartSec=120
+SyslogIdentifier=audiohub-update-check

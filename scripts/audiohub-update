@@ -2,17 +2,28 @@
 # audiohub-update — release updater for deployed Audio Hub units.
 #
 # Installed to /usr/local/sbin/audiohub-update by install.sh and driven by
-# audiohub-update.timer (weekly, Sun 04:30 + random hour). Also safe to run
-# by hand:
+# audiohub-update.timer (weekly, Sun 04:30 + random hour) plus the daily
+# availability check feeding the HA update entity. Also safe to run by hand:
 #   sudo audiohub-update            # apply the channel's release if newer
 #   sudo audiohub-update --check    # resolve + compare only, change nothing
 #   sudo audiohub-update --force    # re-apply even if not newer (repair)
 #
 # Channel and pin come from /etc/audiohub/unit.env:
-#   AUDIOHUB_AUTO_UPDATE=true|false    timer honors this; manual runs always run
+#   AUDIOHUB_AUTO_UPDATE=true|false    timer fallback; manual runs always run
 #   AUDIOHUB_RELEASE_CHANNEL=stable    stable (promoted) | canary (pre-releases)
-#   AUDIOHUB_RELEASE=v1.0.2            explicit pin; overrides the channel
+#   AUDIOHUB_RELEASE=v1.0.2            explicit pin; overrides EVERYTHING
 #   AUDIOHUB_UPDATE_REBOOT=false       true reboots after a successful update
+#
+# HA integration (Section 4.7 of docs/ha-configuration-spec.md): the hub
+# user's settings.json overrides AUTO_UPDATE / RELEASE_CHANNEL at runtime
+# (changed from the HA device page). An explicit AUDIOHUB_RELEASE pin still
+# wins over everything. Two extra options serve the HA update entity:
+#   --status-file PATH   write a JSON status record (installed/latest/
+#                        in_progress) for hubd to publish
+#   --request-token TOK  echo this token in the status record — hubd only
+#                        trusts a status that echoes its own request token
+# The audiohub-update-request.path unit fires on hubd's request file: it
+# reads the token, removes the file, and runs this script (manual mode).
 #
 # Updates are forward-only in scheduled mode: a pin or channel that resolves
 # OLDER than the deployed version is skipped (pin + manual run = rollback).
@@ -25,6 +36,8 @@ API_REPO="https://api.github.com/repos/${GH_REPO}"
 TARBALL_BASE="https://github.com/${GH_REPO}/archive"
 INSTALL_ROOT="/opt/audio-hub"
 UNIT_ENV="${AUDIOHUB_CONFIG:-/etc/audiohub/unit.env}"
+STATUS_FILE=""
+REQUEST_TOKEN=""
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -142,6 +155,52 @@ env_value() { # env_value <KEY> -> value (last assignment wins, surrounding quot
         | sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//' || true
 }
 
+hub_home() { # hub_home <user> -> home dir (AUDIOHUB_HUB_HOME overrides, mirroring AUDIOHUB_CONFIG)
+    if [ -n "${AUDIOHUB_HUB_HOME:-}" ]; then
+        echo "$AUDIOHUB_HUB_HOME"
+    else
+        getent passwd "$1" | cut -d: -f6
+    fi
+}
+
+settings_value() { # settings_value <user> <key> -> value from settings.json
+    # Reads the hub user's runtime settings (written by hubd on HA entity
+    # changes). Bools print true/false; select options print as-is; absent
+    # keys print nothing so the caller can fall through to unit.env.
+    local f
+    f="$(hub_home "$1")/.config/audiohub/settings.json"
+    [ -r "$f" ] || return 0
+    python3 - "$f" "$2" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        v = json.load(fh).get("values", {}).get(sys.argv[2])
+    if isinstance(v, bool):
+        print("true" if v else "false")
+    elif isinstance(v, str):
+        print(v)
+except Exception:
+    pass
+PY
+}
+
+write_status() { # write_status <installed> <latest> <true|false> <error-msg>
+    # Terminal status for the HA update entity. A run that consumed a
+    # request token ALWAYS writes here (success or failure) echoing that
+    # token, so hubd can leave in_progress; the daily check writes its
+    # availability without a token. Controlled strings only — error text
+    # must stay JSON-safe.
+    [ -n "$STATUS_FILE" ] || return 0
+    local token="null" err="null"
+    [ -n "$REQUEST_TOKEN" ] && token="\"$REQUEST_TOKEN\""
+    [ -n "$4" ] && err="\"$4\""
+    printf '{"installed_version": "%s", "latest_version": "%s", "in_progress": %s, "token": %s, "error": %s, "timestamp": "%s"}\n' \
+        "$1" "$2" "$3" "$token" "$err" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        > "$STATUS_FILE" 2>/dev/null \
+        || log_warn "cannot write status file $STATUS_FILE"
+    return 0
+}
+
 hub_user() {
     local u
     u="$(env_value AUDIOHUB_USER)"
@@ -210,21 +269,23 @@ rollback() { # rollback <hub-user>
 }
 
 usage() {
-    sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # ---------------------------------------------------------------------------
 
 main() {
-    local arg
-    for arg in "$@"; do
-        case "$arg" in
+    while [ $# -gt 0 ]; do
+        case "$1" in
             --check) MODE="check" ;;
             --force) MODE="force" ;;
             --scheduled) MODE="scheduled" ;;
+            --status-file) STATUS_FILE="${2:-}"; shift ;;
+            --request-token) REQUEST_TOKEN="${2:-}"; shift ;;
             -h|--help) usage; exit 0 ;;
-            *) log_error "Unknown option: $arg"; usage; exit 2 ;;
+            *) log_error "Unknown option: $1"; usage; exit 2 ;;
         esac
+        shift
     done
 
     if [ "${EUID:-$(id -u)}" -ne 0 ]; then
@@ -232,39 +293,45 @@ main() {
         exit 1
     fi
 
-    # Timer runs use --scheduled; units with auto-updates disabled just exit.
-    # Default is DISABLED: a self-updating appliance is opt-in per unit.
+    local user pin channel target current auto
+    user="$(hub_user)"
+    if [ -z "$user" ] || ! id "$user" &>/dev/null; then
+        log_error "Cannot determine the hub user — set AUDIOHUB_USER in $UNIT_ENV"
+        write_status "$(deployed_version)" "" false "cannot determine hub user"
+        exit 1
+    fi
+
+    # Timer runs use --scheduled; the auto-update preference lives in the
+    # hub user's settings.json (runtime, from HA) with unit.env as the
+    # fallback. Default is DISABLED: a self-updating appliance is opt-in
+    # per unit. Manual runs (HA Install button, hand) always run.
     if [ "$MODE" = "scheduled" ]; then
-        local auto
-        auto="$(env_value AUDIOHUB_AUTO_UPDATE)"
+        auto="$(settings_value "$user" auto_update)"
+        [ -z "$auto" ] && auto="$(env_value AUDIOHUB_AUTO_UPDATE)"
         auto="${auto:-false}"
         if [ "$auto" != "true" ]; then
-            echo "audiohub-update: auto-updates disabled (AUDIOHUB_AUTO_UPDATE=$auto); skipping"
+            echo "audiohub-update: auto-updates disabled (auto_update=$auto); skipping"
             exit 0
         fi
     fi
 
     [ -d "$INSTALL_ROOT" ] || {
         log_error "$INSTALL_ROOT does not exist — deploy with bootstrap.sh first"
+        write_status "$(deployed_version)" "" false "install root missing"
         exit 1
     }
-
-    local user pin channel target current
-    user="$(hub_user)"
-    if [ -z "$user" ] || ! id "$user" &>/dev/null; then
-        log_error "Cannot determine the hub user — set AUDIOHUB_USER in $UNIT_ENV"
-        exit 1
-    fi
 
     pin="$(env_value AUDIOHUB_RELEASE)"
     if [ -n "$pin" ]; then
         target="$pin"
         log_info "Release pinned via AUDIOHUB_RELEASE: $target"
     else
-        channel="$(env_value AUDIOHUB_RELEASE_CHANNEL)"
+        channel="$(settings_value "$user" release_channel)"
+        [ -z "$channel" ] && channel="$(env_value AUDIOHUB_RELEASE_CHANNEL)"
         channel="${channel:-stable}"
         if ! target="$(resolve_release "$channel")"; then
             log_error "Cannot resolve channel '$channel' (GitHub API unreachable or no releases)"
+            write_status "$(deployed_version)" "" false "release resolve failed"
             exit 1
         fi
     fi
@@ -272,6 +339,7 @@ main() {
     current="$(deployed_version)"
     if [ "$target" = "$current" ] && [ "$MODE" != "force" ]; then
         echo "audiohub-update: already on $target"
+        write_status "$target" "$target" false ""
         exit 0
     fi
 
@@ -284,6 +352,7 @@ main() {
 
     if [ "$MODE" = "check" ]; then
         echo "audiohub-update: deployed $current, channel/pin resolves to $target"
+        write_status "$current" "$target" false ""
         [ "$target" = "$current" ] && exit 0
         exit 3
     fi
@@ -304,8 +373,15 @@ main() {
 
     if (cd "$INSTALL_ROOT" && AUDIOHUB_USER="$user" bash install.sh); then
         echo "$target" > /etc/audiohub/version
+        # Status lands on disk BEFORE hubd is restarted, so the fresh
+        # process publishes the new version on reconnect (Section 4.7).
+        write_status "$target" "$target" false ""
     else
-        rollback "$user"
+        if rollback "$user"; then
+            write_status "$current" "$target" false "install failed (rolled back)"
+        else
+            write_status "$current" "$target" false "install failed (rollback incomplete)"
+        fi
         exit 1
     fi
 

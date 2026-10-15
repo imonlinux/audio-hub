@@ -80,6 +80,8 @@ Channels and per-unit settings live in `unit.env`:
 
 **Rollback**: set `AUDIOHUB_RELEASE=v1.2.2` in `unit.env` and run `sudo audiohub-update`. Scheduled updates are forward-only — a channel resolving to something older than the deployed version is skipped.
 
+**From Home Assistant**: each unit also exposes a Firmware update entity (Settings → Updates, and on the device page). A daily check publishes availability; the Install button drops a request file that a root systemd path unit feeds to `audiohub-update` — hubd itself stays unprivileged. Auto Update and Release Channel changed on the HA device page are stored in `settings.json` and honored by the weekly scheduled run; `unit.env` remains the fleet default, and an explicit `AUDIOHUB_RELEASE` pin overrides everything.
+
 ## Cutting a release (maintainer)
 
 1. Tag and push: `git tag v1.2.3 && git push origin v1.2.3`. CI attaches `sha256sums.txt` (of the exact archives devices download) and publishes the release as a **pre-release** — that is the **canary** channel.

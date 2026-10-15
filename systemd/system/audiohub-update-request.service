@@ -1,0 +1,18 @@
+[Unit]
+Description=Apply an Audio Hub update requested from Home Assistant
+Documentation=https://github.com/imonlinux/audio-hub#updating
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Read the request token, clear the request file, then hand the token to
+# the updater so the status it writes can be matched back to THIS request
+# (hubd ignores status files that do not echo its pending token).
+# NOTE: $$ is a literal $ for systemd — the shell needs $token at runtime.
+ExecStart=/bin/sh -c 'token=$$(cat /run/audiohub/update-request 2>/dev/null); rm -f /run/audiohub/update-request; if [ -n "$$token" ]; then exec /usr/local/sbin/audiohub-update --status-file /run/audiohub/update-status.json --request-token "$$token"; else exec /usr/local/sbin/audiohub-update --status-file /run/audiohub/update-status.json; fi'
+# Downloads + install + audio-stack restart can legitimately take minutes;
+# killing an update mid-install is the one thing this unit must never do
+# (the systemd default of 90 s would).
+TimeoutStartSec=0
+SyslogIdentifier=audiohub-update-request

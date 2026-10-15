@@ -1,0 +1,14 @@
+[Unit]
+Description=Daily Audio Hub update availability check
+Documentation=https://github.com/imonlinux/audio-hub#updating
+
+[Timer]
+# Daily availability check for the HA update entity — off the weekly
+# apply window (Sunday 04:30) on purpose: checks are read-only.
+OnCalendar=*-*-* 06:15:00
+RandomizedDelaySec=20m
+# If the Pi was off at fire time, run the check at the next boot.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -25,6 +25,7 @@ mkrelease() { # mkrelease <tag>
 FAILTAG="v9.9.9-fail"
 mkrelease v1.0.0
 mkrelease v1.1.0
+mkrelease v1.2.0
 mkrelease "$FAILTAG"
 { sha256sum "$T"/audio-hub-*.tar.gz | sed "s|$T/||"; } > "$T/sha256sums.txt"
 
@@ -53,6 +54,7 @@ TARBALL_BASE="$T/archive"
 api_get() {
     case "$1" in
         /releases/latest) printf '%s\n200' "$(printf '{"tag_name": "%s"}' "$MOCK_TAG")" ;;
+        /releases*per_page=1) printf '%s\n200' "$(printf '{"tag_name": "%s"}' "${MOCK_CANARY_TAG:-$MOCK_TAG}")" ;;
         *) printf '\n404' ;;
     esac
 }
@@ -106,6 +108,75 @@ check "old tree restored"       "payload-v1.1.0" "$(cat "$T/opt/audio-hub/PAYLOA
 check "release-tag restored"    "v1.1.0"         "$(cat "$T/opt/audio-hub/.release-tag")"
 check "version stamp restored"  "v1.1.0"         "$(cat "$T/etc/audiohub/version")"
 grep -q "install user=" <(tail -1 "$T/install.log") && ok "rollback re-ran installer" || fail "no rollback install in log"
+
+# --- HA settings.json overrides (spec Section 4.7) -----------------------
+export AUDIOHUB_HUB_HOME="$T/hubhome"
+mkdir -p "$AUDIOHUB_HUB_HOME/.config/audiohub" "$T/run"
+STATUS="$T/run/update-status.json"
+echo "AUDIOHUB_AUTO_UPDATE=false" >> "$AUDIOHUB_CONFIG"
+
+echo "== settings.json auto_update=true overrides unit.env false =="
+echo '{"values": {"auto_update": true}}' > "$AUDIOHUB_HUB_HOME/.config/audiohub/settings.json"
+MOCK_TAG="v1.2.0"
+MODE="scheduled"
+out="$(main --scheduled 2>&1)"; rc=$?
+check "HA opt-in runs the scheduled update" "0" "$rc"
+check "tree updated via HA preference" "payload-v1.2.0" "$(cat "$T/opt/audio-hub/PAYLOAD")"
+check "version stamp updated"    "v1.2.0"         "$(cat "$T/etc/audiohub/version")"
+
+echo "== settings.json auto_update=false overrides unit.env true =="
+echo '{"values": {"auto_update": false}}' > "$AUDIOHUB_HUB_HOME/.config/audiohub/settings.json"
+MODE="scheduled"
+out="$(main --scheduled 2>&1)"; rc=$?
+check "HA opt-out skips" "0" "$rc"
+grep -qi "disabled" <<<"$out" && ok "says why" || fail "no disabled note in: $out"
+
+echo "== absent settings.json falls back to unit.env =="
+rm -f "$AUDIOHUB_HUB_HOME/.config/audiohub/settings.json"
+MODE="scheduled"
+out="$(main --scheduled 2>&1)"; rc=$?
+check "unit.env AUTO_UPDATE=false still honored" "0" "$rc"
+grep -qi "disabled" <<<"$out" && ok "fallback reads unit.env" || fail "no disabled note in: $out"
+
+echo "== release_channel: settings.json canary overrides unit.env stable =="
+echo '{"values": {"release_channel": "canary"}}' > "$AUDIOHUB_HUB_HOME/.config/audiohub/settings.json"
+MOCK_TAG="v1.2.0"; MOCK_CANARY_TAG="v1.1.0"
+MODE="manual"
+rm -f "$STATUS"
+out="$(main --check --status-file "$STATUS" 2>&1)"; rc=$?
+check "canary check exits 3 when stale" "3" "$rc"
+grep -q "resolves to v1.1.0" <<<"$out" && ok "channel came from settings.json" || fail "canary not used: $out"
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d["installed_version"]=="v1.2.0" and d["latest_version"]=="v1.1.0" and d["token"] is None and d["error"] is None else 1)' "$STATUS" \
+    && ok "daily-check status: availability without token" || fail "bad check status: $(cat "$STATUS")"
+
+echo '{"values": {"release_channel": "stable"}}' > "$AUDIOHUB_HUB_HOME/.config/audiohub/settings.json"
+out="$(main --check --status-file "$STATUS" 2>&1)"; rc=$?
+check "stable check exits 0 when current" "0" "$rc"
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d["latest_version"]=="v1.2.0" and d["installed_version"]=="v1.2.0" else 1)' "$STATUS" \
+    && ok "stable channel resolves the deployed tag" || fail "bad stable status: $(cat "$STATUS")"
+
+echo "== requested install echoes the request token (already current) =="
+rm -f "$STATUS"
+MOCK_TAG="v1.2.0"
+out="$(main --status-file "$STATUS" --request-token abc123def 2>&1)"; rc=$?
+check "already-current run exits 0" "0" "$rc"
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d["token"]=="abc123def" and d["error"] is None else 1)' "$STATUS" \
+    && ok "completion token echoed" || fail "token not echoed: $(cat "$STATUS")"
+
+echo "== failed requested install echoes token with the error =="
+rm -f "$STATUS"
+MOCK_TAG="$FAILTAG"
+MODE="manual"
+out="$(main --status-file "$STATUS" --request-token feedface 2>&1)"; rc=$?
+check "failed update exits nonzero" "1" "$rc"
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d["token"]=="feedface" and d["installed_version"]=="v1.2.0" and "install failed" in d["error"] else 1)' "$STATUS" \
+    && ok "failure status echoes token + old version" || fail "bad failure status: $(cat "$STATUS")"
+check "tree restored after failed request" "payload-v1.2.0" "$(cat "$T/opt/audio-hub/PAYLOAD")"
+
+# leave the late sections untouched: no settings.json, default channel
+rm -f "$AUDIOHUB_HUB_HOME/.config/audiohub/settings.json"
+unset AUDIOHUB_HUB_HOME
+sed -i '/AUDIOHUB_AUTO_UPDATE=false/d' "$AUDIOHUB_CONFIG"
 
 echo "== check mode =="
 MOCK_TAG="v1.1.0"

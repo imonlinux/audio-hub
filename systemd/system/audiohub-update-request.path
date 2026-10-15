@@ -1,0 +1,12 @@
+[Unit]
+Description=Audio Hub update request from Home Assistant (watches the request file)
+Documentation=https://github.com/imonlinux/audio-hub#updating
+
+[Path]
+# hubd (unprivileged) drops a token into this file when HA presses Install;
+# /run/audiohub is created at boot by systemd-tmpfiles with hub-user
+# ownership, so the daemon can write it and this root unit can consume it.
+PathExists=/run/audiohub/update-request
+
+[Install]
+WantedBy=multi-user.target

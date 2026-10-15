@@ -169,6 +169,17 @@ check_services() {
     [ -f "$HOME/.config/sendspin/settings-daemon.json" ] \
         && pass "Sendspin settings present" \
         || warn "Sendspin settings not yet provisioned (created on first sendspin start)"
+    # HA update entity plumbing (spec Section 4.7)
+    if system_service_active audiohub-update-request.path; then
+        pass "audiohub-update-request.path watching (HA Install works)"
+    else
+        fail "audiohub-update-request.path not active — the HA Install button does nothing (run: sudo ./install.sh)"
+    fi
+    if system_service_active audiohub-update-check.timer; then
+        pass "audiohub-update-check.timer scheduled (daily availability check)"
+    else
+        fail "audiohub-update-check.timer not active — the Firmware entity never sees new releases (run: sudo ./install.sh)"
+    fi
 }
 
 check_linger() {

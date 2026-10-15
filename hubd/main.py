@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import select
 import signal
 import struct
@@ -72,6 +73,15 @@ def audiohub_version() -> str:
     except Exception:
         pass
     return "dev"
+
+
+# Update handshake paths (spec Section 4.7). /run/audiohub is created at boot
+# by systemd-tmpfiles (installer-written /etc/tmpfiles.d/audiohub.conf) with
+# hub-user ownership: the unprivileged daemon drops request files there and
+# reads the status file the root updater writes back. Overridable for tests.
+UPDATE_REQUEST_PATH = "/run/audiohub/update-request"
+UPDATE_STATUS_PATH = "/run/audiohub/update-status.json"
+RELEASE_URL_BASE = "https://github.com/imonlinux/audio-hub/releases/tag/"
 
 
 # -----------------------------------------------------------------------------
@@ -1112,8 +1122,10 @@ class MQTTBridge:
         self._ir_edit_key_callback = None
         self._ir_edit_action_callback = None
         self._ir_edit_identify_callback = None
+        self._update_install_callback = None
         self._state_provider = None
         self._selection_provider = None
+        self._update_provider = None
         self._ir_map = ir_map
         self.settings = settings
         # Last known select options; updated by publish_selection_discovery.
@@ -1155,6 +1167,10 @@ class MQTTBridge:
         """Register callback() for {id}/ir_edit/identify/set (PRESS)."""
         self._ir_edit_identify_callback = callback
 
+    def on_update_install(self, callback):
+        """Register callback() for {id}/update/install (payload "install")."""
+        self._update_install_callback = callback
+
     def attach_state_provider(self, provider):
         """Register fn() -> dict with current state, published on connect.
         Called on the asyncio loop (see _publish_initial_state)."""
@@ -1164,6 +1180,12 @@ class MQTTBridge:
         """Register fn() -> {"options": {...}, "effective": {...}} for the
         device-selection entities, gathered on the asyncio loop at connect."""
         self._selection_provider = provider
+
+    def attach_update_provider(self, provider):
+        """Register fn() that refreshes + publishes the Firmware update
+        entity state (reads the updater's status file), gathered on the
+        asyncio loop at connect and on every state-sync tick."""
+        self._update_provider = provider
 
     def _availability_topic(self) -> str:
         return f"{self.cfg.mqtt_base_topic}/sensor/{self.cfg.device_id}_availability/state"
@@ -1249,6 +1271,7 @@ class MQTTBridge:
         client.subscribe(f"{self.cfg.device_id}/tv_source/set")
         client.subscribe(f"{self.cfg.device_id}/setting/+/set")
         client.subscribe(f"{self.cfg.device_id}/ir_edit/+/set")
+        client.subscribe(f"{self.cfg.device_id}/update/install")
 
         client.publish(self._availability_topic(), "online", retain=True)
         self._publish_discovery(client)
@@ -1294,6 +1317,12 @@ class MQTTBridge:
                 elif parts[1] == "identify" and payload == "PRESS" \
                         and self._ir_edit_identify_callback is not None:
                     self._emit(self._ir_edit_identify_callback)
+            # {id}/update/install -> Firmware update Install button (Section
+            # 4.7); hubd only drops the request file, the root path unit
+            # does the privileged work
+            elif len(parts) == 2 and parts[0] == "update" and parts[1] == "install":
+                if payload == "install" and self._update_install_callback is not None:
+                    self._emit(self._update_install_callback)
             # {id}/setting/{key}/set -> runtime setting ("reset" = Reset button)
             elif len(parts) == 3 and parts[0] == "setting" and parts[2] == "set":
                 if self._setting_callback is not None:
@@ -1434,6 +1463,7 @@ class MQTTBridge:
 
         entities.extend(self._selection_discovery(base, dev_id, availability, device))
         entities.extend(self._ir_discovery(base, dev_id, availability, device))
+        entities.extend(self._update_discovery(base, dev_id, availability, device))
         if self.settings is not None:
             entities.extend(self._settings_discovery(base, dev_id, availability, device))
 
@@ -1444,6 +1474,43 @@ class MQTTBridge:
         self._retire_layer1(base, dev_id)
 
         log.info(f"Published {len(entities)} discovery entities")
+
+    def _update_discovery(self, base: str, dev_id: str, availability: str,
+                          device: dict) -> list:
+        """Firmware update entity (spec Section 4.7). HA renders it under
+        Settings -> Updates and on the device page with its standard Install
+        button, release link and progress state; the state topic carries the
+        JSON the MQTT update platform expects."""
+        return [(
+            f"{base}/update/{dev_id}_firmware/config",
+            {
+                "name": "Firmware",
+                "unique_id": f"{dev_id}_firmware",
+                "entity_category": "diagnostic",
+                "state_topic": f"{dev_id}/update/state",
+                "command_topic": f"{dev_id}/update/install",
+                "payload_install": "install",
+                "availability_topic": availability,
+                "icon": "mdi:package-up",
+                "device": device,
+            },
+        )]
+
+    def publish_update_state(self, installed: str, latest: str,
+                             in_progress: bool):
+        """Firmware entity state JSON: installed/latest versions, release
+        link and in-progress flag. An unknown latest falls back to the
+        installed version (entity reads "up to date" until a check runs)."""
+        latest = latest or installed
+        payload = {
+            "installed_version": installed,
+            "latest_version": latest,
+            "title": "audio-hub",
+            "in_progress": bool(in_progress),
+        }
+        if latest.startswith("v"):
+            payload["release_url"] = RELEASE_URL_BASE + latest
+        self._publish(f"{self.cfg.device_id}/update/state", json.dumps(payload))
 
     def ir_key_options(self) -> list:
         """Sorted union of factory, bound, and seen keys — the IR: Key select
@@ -1741,6 +1808,11 @@ class MQTTBridge:
                 self._ir_map.get(default) if default else None)
             self.publish_ir_edit_status("idle")
             self.publish_ir_mappings()
+        if self._update_provider is not None:
+            try:
+                self._update_provider()
+            except Exception as e:
+                log.warning(f"Could not publish update state: {e}")
 
     def publish_volume(self, source: str, level: float):
         topic = (
@@ -2196,6 +2268,15 @@ class HubDaemon:
         self._ir_status_generation = 0
         self._ir_last_repeat: dict[str, float] = {}
 
+        # Update entity (Section 4.7): the token of the install request we
+        # dropped (None = nothing pending), the last state read from the
+        # updater's status file, and the last payload published (dedup —
+        # the 2 s tick must not spam the retained topic).
+        self._update_pending_token: "str | None" = None
+        self._update_state: dict = {"installed": audiohub_version(),
+                                    "latest": "", "error": None}
+        self._update_last_payload: "str | None" = None
+
         # MQTT command handlers (run on the asyncio loop)
         self.mqtt.on_volume_command("tv", self._on_tv_volume)
         self.mqtt.on_volume_command("bt", self._on_bt_volume)
@@ -2208,8 +2289,10 @@ class HubDaemon:
         self.mqtt.on_ir_edit_key(self._on_ir_edit_key)
         self.mqtt.on_ir_edit_action(self._on_ir_edit_action)
         self.mqtt.on_ir_edit_identify(self._on_ir_edit_identify)
+        self.mqtt.on_update_install(self._on_update_install)
         self.mqtt.attach_state_provider(self._snapshot)
         self.mqtt.attach_selection_provider(self._selection_snapshot)
+        self.mqtt.attach_update_provider(self._update_snapshot)
 
         # IR keypresses (run on the asyncio loop)
         self.ir.on_key(self._on_ir_key)
@@ -2463,6 +2546,87 @@ class HubDaemon:
         self.mqtt.publish_mute(muted)
         log.info(f"IR mute -> {'on' if muted else 'off'}")
 
+    # -- update entity (Section 4.7, loop thread) --------------------------------
+    def _on_update_install(self):
+        """HA pressed Install: drop the request file for the root path unit
+        and flip the entity to in-progress. hubd gains no privilege — the
+        request file is just a token the root updater consumes. A second
+        request while one is pending is ignored (the updater also refuses
+        the file until its run finishes)."""
+        if self._update_pending_token is not None:
+            log.warning("Update: install requested while one is in progress; ignored")
+            return
+        token = secrets.token_hex(16)
+        try:
+            os.makedirs(os.path.dirname(UPDATE_REQUEST_PATH), exist_ok=True)
+            tmp = UPDATE_REQUEST_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(token)
+            os.replace(tmp, UPDATE_REQUEST_PATH)
+        except OSError as e:
+            log.error(f"Update: cannot write request file "
+                      f"{UPDATE_REQUEST_PATH}: {e}")
+            return
+        self._update_pending_token = token
+        log.info(f"Update: install requested from HA (token {token[:8]}...)")
+        self._publish_update()
+
+    def _update_refresh_state(self):
+        """Read the updater's status file (fresh from the daily check, or
+        the completion record of our own request). The state only counts as
+        ours when the status echoes the pending token — a status file left
+        by yesterday's daily check must never flap an in-progress entity
+        back to 'up to date' mid-install (Section 4.7)."""
+        try:
+            with open(UPDATE_STATUS_PATH) as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return
+        except Exception as e:
+            log.debug(f"update status unreadable: {e}")
+            return
+        if not isinstance(data, dict):
+            return
+        if self._update_pending_token is not None:
+            if data.get("token") != self._update_pending_token:
+                return
+            self._update_pending_token = None
+            err = data.get("error")
+            log.info("Update: requested run finished"
+                     + (f" with error: {err}" if err else " successfully"))
+        self._update_state = {
+            "installed": str(data.get("installed_version") or audiohub_version()),
+            "latest": str(data.get("latest_version") or ""),
+            "error": data.get("error") or None,
+        }
+
+    def _publish_update(self):
+        """Publish the Firmware entity state, skipping identical payloads
+        (the tick runs every 2 s against a retained topic)."""
+        installed = self._update_state.get("installed") or audiohub_version()
+        latest = self._update_state.get("latest") or ""
+        payload = json.dumps({
+            "installed_version": installed,
+            "latest_version": latest or installed,
+            "in_progress": self._update_pending_token is not None,
+        })
+        if payload != self._update_last_payload:
+            self._update_last_payload = payload
+            self.mqtt.publish_update_state(installed, latest,
+                                           self._update_pending_token is not None)
+
+    def _update_snapshot(self):
+        """Provider for the MQTT bridge at connect: refresh from the status
+        file, then publish (a fresh process starts not-in-progress; after an
+        install the new process reconnects reporting the new version — the
+        expected sequence)."""
+        self._update_refresh_state()
+        self._publish_update()
+
+    def _update_status_tick(self):
+        self._update_refresh_state()
+        self._publish_update()
+
     # -- device selection reconciler (loop thread) ------------------------------
     def _selection_snapshot(self) -> dict:
         """Provider for the MQTT bridge at connect: run one reconcile tick
@@ -2565,6 +2729,10 @@ class HubDaemon:
                 self._ir_identify_tick()
             except Exception as e:
                 log.debug(f"ir identify tick error: {e}")
+            try:
+                self._update_status_tick()
+            except Exception as e:
+                log.debug(f"update status tick error: {e}")
             snap = {}
             for source, bus in (("tv", self.cfg.bus_tv), ("bt", self.cfg.bus_bt),
                                 ("music", self.cfg.bus_music)):

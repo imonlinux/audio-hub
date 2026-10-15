@@ -19,7 +19,7 @@ done
 if [ -x .venv/bin/python ]; then
     for t in tests/test_device_selection.py tests/test_selection_reconcile.py \
              tests/test_ir_mapping.py tests/test_ir_editor.py \
-             tests/test_settings.py; do
+             tests/test_settings.py tests/test_update_entity.py; do
         echo "### $t"
         .venv/bin/python "$t" 2>&1 | tail -1 || rc=1
         echo
