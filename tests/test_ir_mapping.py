@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Unit tests for hubd's configurable IR key mapping (spec Section 7.1).
+"""Unit tests for hubd's configurable IR key mapping core (spec Section 4.4).
 
-Covers: IRMapStore persistence and validation, key dispatch (mapped, ignore,
-unmapped-once, ducking path), hold-to-repeat rules, the bind-capture state
-machine (arm, bind, rebind, timeout, dispatch suppression, status transitions),
-direct per-key select commands, and the IR discovery payloads.
+Covers: IRMapStore v2 persistence and validation, key dispatch (mapped,
+ignore, unmapped-once, ducking path, event publishing), and hold-to-repeat
+rules. The IR editor flows, map v2 migration, Layer 1 entity retirement, and
+the IR Remote event entity are covered in tests/test_ir_editor.py.
 
 Run from the repo root:
 
@@ -15,7 +15,6 @@ Pi installs.) No audio stack or broker required; MQTT publishes are recorded
 via a stub client.
 """
 
-import asyncio
 import json
 import os
 import sys
@@ -104,22 +103,23 @@ class TestIRMapStore(unittest.TestCase):
     def test_absent_file_is_factory_map(self):
         with tempfile.TemporaryDirectory() as d:
             store = hubd.IRMapStore(os.path.join(d, "ir_map.json"))
-            self.assertEqual(store.snapshot(), dict(hubd.IR_FACTORY_MAP))
+            self.assertEqual(store.mapped(), dict(hubd.IR_FACTORY_MAP))
+            self.assertEqual(store.bindings(), {})
+            self.assertEqual(store.seen(), [])
 
     def test_round_trip(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "sub", "ir_map.json")
             store = hubd.IRMapStore(path)
-            store.set("KEY_PLAYPAUSE", "ignore")
             store.set("KEY_MUTE", "ducking_toggle")
             again = hubd.IRMapStore(path)
-            self.assertEqual(again.get("KEY_PLAYPAUSE"), "ignore")
             self.assertEqual(again.get("KEY_MUTE"), "ducking_toggle")
             # factory entries survive alongside user entries
             self.assertEqual(again.get("KEY_VOLUMEUP"), "volume_up")
             with open(path) as f:
                 on_disk = json.load(f)
-            self.assertEqual(on_disk["KEY_PLAYPAUSE"], "ignore")
+            self.assertEqual(on_disk["version"], 2)
+            self.assertEqual(on_disk["bindings"]["KEY_MUTE"], "ducking_toggle")
 
     def test_corrupt_file_falls_back_to_defaults(self):
         with tempfile.TemporaryDirectory() as d:
@@ -127,7 +127,7 @@ class TestIRMapStore(unittest.TestCase):
             with open(path, "w") as f:
                 f.write("{not json")
             store = hubd.IRMapStore(path)
-            self.assertEqual(store.snapshot(), dict(hubd.IR_FACTORY_MAP))
+            self.assertEqual(store.mapped(), dict(hubd.IR_FACTORY_MAP))
 
     def test_non_object_file_falls_back_to_defaults(self):
         with tempfile.TemporaryDirectory() as d:
@@ -135,18 +135,18 @@ class TestIRMapStore(unittest.TestCase):
             with open(path, "w") as f:
                 json.dump(["not", "an", "object"], f)
             store = hubd.IRMapStore(path)
-            self.assertEqual(store.snapshot(), dict(hubd.IR_FACTORY_MAP))
+            self.assertEqual(store.mapped(), dict(hubd.IR_FACTORY_MAP))
 
     def test_invalid_key_dropped(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "ir_map.json")
             with open(path, "w") as f:
                 json.dump({"NOT_A_KEY_NAME": "volume_up",
-                           "KEY_PLAYPAUSE": "ignore"}, f)
+                           "KEY_PLAYPAUSE": "none"}, f)
             with self.assertLogs(hubd.log, level="WARNING"):
                 store = hubd.IRMapStore(path)
             self.assertIsNone(store.get("NOT_A_KEY_NAME"))
-            self.assertEqual(store.get("KEY_PLAYPAUSE"), "ignore")
+            self.assertEqual(store.get("KEY_PLAYPAUSE"), "none")
 
     def test_invalid_action_dropped(self):
         with tempfile.TemporaryDirectory() as d:
@@ -157,14 +157,53 @@ class TestIRMapStore(unittest.TestCase):
                 store = hubd.IRMapStore(path)
             self.assertIsNone(store.get("KEY_PLAYPAUSE"))
 
-    def test_factory_entry_cannot_be_removed_by_file(self):
-        # A file entry cannot erase a factory binding; it can only rebind it.
+    def test_tombstone_blocks_factory_binding(self):
+        # "none" is an explicit unbind: the factory overlay must not re-add
+        # the binding (Section 4.4 map v2).
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "ir_map.json")
-            with open(path, "w") as f:
-                json.dump({"KEY_VOLUMEUP": "ignore"}, f)
             store = hubd.IRMapStore(path)
-            self.assertEqual(store.get("KEY_VOLUMEUP"), "ignore")
+            store.set("KEY_VOLUMEUP", "none")
+            again = hubd.IRMapStore(path)
+            self.assertEqual(again.get("KEY_VOLUMEUP"), "none")
+            self.assertNotIn("KEY_VOLUMEUP", again.mapped())
+
+    def test_set_rejects_unknown_action(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = hubd.IRMapStore(os.path.join(d, "ir_map.json"))
+            with self.assertRaises(ValueError):
+                store.set("KEY_MUTE", "explode")
+
+    def test_record_seen_most_recent_first_capped(self):
+        # 37 distinct VALID evdev keys: KEY_A..KEY_Z (26) + KEY_F1..KEY_F11.
+        # (Linux has no KEY_F0 and stops at KEY_F24; invalid names would be
+        # refused by record_seen.)
+        keys = [f"KEY_{chr(ord('A') + i)}" for i in range(26)]
+        keys += [f"KEY_F{i}" for i in range(1, 12)]
+        self.assertEqual(len(keys), hubd.IRMapStore.SEEN_CAP + 5)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ir_map.json")
+            store = hubd.IRMapStore(path)
+            added = set()
+            for key in keys:
+                self.assertEqual(store.record_seen(key), key not in added)
+                added.add(key)
+            self.assertEqual(len(store.seen()), hubd.IRMapStore.SEEN_CAP)
+            self.assertEqual(store.seen()[0], "KEY_F11")  # most recent first
+            self.assertNotIn("KEY_A", store.seen())       # oldest evicted
+            again = hubd.IRMapStore(path)
+            self.assertEqual(again.seen(), store.seen())
+
+    def test_mapped_excludes_inert_and_never_bound(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = hubd.IRMapStore(os.path.join(d, "ir_map.json"))
+            store.set("KEY_MUTE", "none")
+            store.set("KEY_PLAYPAUSE", "volume_up")
+            self.assertEqual(store.mapped(), {
+                "KEY_VOLUMEUP": "volume_up",
+                "KEY_VOLUMEDOWN": "volume_down",
+                "KEY_PLAYPAUSE": "volume_up",
+            })
 
 
 class TestIRKeyEcodes(unittest.TestCase):
@@ -205,6 +244,12 @@ class TestIRDispatch(unittest.TestCase):
             self.press(daemon, "KEY_MUTE")
             self.assertFalse(daemon.audio.muted)
 
+    def test_none_is_inert(self):
+        with HubDaemonFixture() as daemon:
+            daemon.ir_map.set("KEY_MUTE", "none")
+            self.press(daemon, "KEY_MUTE")
+            self.assertFalse(daemon.audio.muted)
+
     def test_ducking_toggle_reaches_ducking_path(self):
         with HubDaemonFixture() as daemon:
             daemon.ir_map.set("KEY_MUTE", "ducking_toggle")
@@ -213,23 +258,31 @@ class TestIRDispatch(unittest.TestCase):
             self.press(daemon, "KEY_MUTE")
             self.assertEqual(daemon.ducking.calls, [False, True])
 
-    def test_unmapped_key_logs_once_and_publishes_last_key(self):
+    def test_unmapped_key_logs_once_and_fires_event(self):
         with HubDaemonFixture() as daemon:
             client = daemon.mqtt.client
             with self.assertLogs(hubd.log, level="INFO") as captured:
                 self.press(daemon, "KEY_PLAYPAUSE")
                 self.press(daemon, "KEY_PLAYPAUSE")
-            sightings = [m for m in captured.output if "KEY_PLAYPAUSE" in m]
+            sightings = [m for m in captured.output if "KEY_PLAYPAUSE" in m
+                         and "unmapped" in m]
             self.assertEqual(len(sightings), 1)
-            self.assertIn("unmapped", sightings[0])
-            payload = client.by_topic().get("t_dev/ir_last_key/state")
-            self.assertEqual(payload, "KEY_PLAYPAUSE")
+            payload = json.loads(
+                client.by_topic()["t_dev/ir/event"])
+            self.assertEqual(payload["event_type"], "KEY_PLAYPAUSE")
+            self.assertEqual(payload["action"], "none")
+            self.assertEqual(payload["label"], "Playpause")
 
-    def test_mapped_press_publishes_last_key(self):
+    def test_mapped_press_fires_event_and_action(self):
         with HubDaemonFixture() as daemon:
             self.press(daemon, "KEY_VOLUMEUP")
-            self.assertEqual(daemon.mqtt.client.by_topic().get("t_dev/ir_last_key/state"),
-                             "KEY_VOLUMEUP")
+            payload = json.loads(
+                daemon.mqtt.client.by_topic()["t_dev/ir/event"])
+            self.assertEqual(payload, {"event_type": "KEY_VOLUMEUP",
+                                       "action": "volume_up",
+                                       "label": "Volume Up"})
+            self.assertAlmostEqual(daemon.audio.volume,
+                                   0.5 + daemon.cfg.ir_volume_step)
 
     def test_worker_translates_press_and_repeat(self):
         with HubDaemonFixture() as daemon:
@@ -287,232 +340,12 @@ class TestIRRepeat(unittest.TestCase):
             daemon._on_ir_key("KEY_VOLUMEUP", False)
             self.assertAlmostEqual(daemon.audio.volume, 0.5 + daemon.cfg.ir_volume_step)
 
-    def test_repeat_suppressed_while_armed(self):
+    def test_repeat_suppressed_while_identify_armed(self):
         with HubDaemonFixture() as daemon:
-            daemon._on_ir_bind_arm()
+            daemon._on_ir_edit_identify()
             daemon._on_ir_key("KEY_VOLUMEUP", True)
             self.assertAlmostEqual(daemon.audio.volume, 0.5)
 
-
-class TestIRCapture(unittest.TestCase):
-    def status(self, client):
-        return client.by_topic().get("t_dev/ir_bind/status/state")
-
-    def test_arm_publishes_armed_status(self):
-        with HubDaemonFixture() as daemon:
-            daemon._on_ir_bind_arm()
-            self.assertEqual(self.status(daemon.mqtt.client), "armed: volume_up")
-            self.assertIsNotNone(daemon._ir_bind)
-
-    def test_bind_new_key(self):
-        with HubDaemonFixture() as daemon:
-            daemon._on_ir_bind_arm()
-            daemon._on_ir_key("KEY_PLAYPAUSE", False)
-            self.assertEqual(daemon.ir_map.get("KEY_PLAYPAUSE"), "volume_up")
-            self.assertEqual(self.status(daemon.mqtt.client), "bound: KEY_PLAYPAUSE -> volume_up")
-            self.assertIsNone(daemon._ir_bind)
-            topics = daemon.mqtt.client.by_topic()
-            self.assertEqual(topics.get("t_dev/ir/KEY_PLAYPAUSE/state"), "volume_up")
-            self.assertIn("t_dev/ir_last_key/state", topics)
-
-    def test_binding_press_does_not_fire_its_action(self):
-        # Rebinding Vol+ must not jump the volume (spec 5.6 step 2).
-        with HubDaemonFixture() as daemon:
-            daemon._on_ir_bind_arm()
-            daemon._on_ir_key("KEY_VOLUMEUP", False)
-            self.assertAlmostEqual(daemon.audio.volume, 0.5)
-            self.assertEqual(daemon.ir_map.get("KEY_VOLUMEUP"), "volume_up")
-
-    def test_dispatch_suppressed_while_armed(self):
-        with HubDaemonFixture() as daemon:
-            daemon._on_ir_bind_arm()
-            daemon._on_ir_key("KEY_MUTE", False)  # press commits a bind instead
-            self.assertFalse(daemon.audio.muted)
-
-    def test_rebind_existing_key(self):
-        with HubDaemonFixture() as daemon:
-            daemon._on_ir_bind_choose("mute_toggle")
-            daemon._on_ir_bind_arm()
-            daemon._on_ir_key("KEY_VOLUMEUP", False)
-            self.assertEqual(daemon.ir_map.get("KEY_VOLUMEUP"), "mute_toggle")
-            self.assertEqual(self.status(daemon.mqtt.client),
-                             "bound: KEY_VOLUMEUP -> mute_toggle")
-            persisted = hubd.IRMapStore(daemon.ir_map.path)
-            self.assertEqual(persisted.get("KEY_VOLUMEUP"), "mute_toggle")
-
-    def test_rearm_restarts_window(self):
-        with HubDaemonFixture() as daemon:
-            daemon._on_ir_bind_arm()
-            first_deadline = daemon._ir_bind["deadline"]
-            daemon._on_ir_bind_arm()
-            self.assertGreater(daemon._ir_bind["deadline"], first_deadline)
-            self.assertEqual(self.status(daemon.mqtt.client), "armed: volume_up")
-
-    def test_timeout(self):
-        with HubDaemonFixture() as daemon:
-            daemon._on_ir_bind_arm()
-            daemon._ir_bind["deadline"] = 0.0  # window already elapsed
-            daemon._ir_bind_tick()
-            self.assertEqual(self.status(daemon.mqtt.client), "timeout")
-            self.assertIsNone(daemon._ir_bind)
-            # factory map untouched
-            self.assertEqual(daemon.ir_map.get("KEY_VOLUMEUP"), "volume_up")
-
-    def test_bind_ignored_after_timeout(self):
-        with HubDaemonFixture() as daemon:
-            daemon._on_ir_bind_arm()
-            daemon._ir_bind_expire()
-            daemon._on_ir_key("KEY_PLAYPAUSE", False)
-            self.assertIsNone(daemon.ir_map.get("KEY_PLAYPAUSE"))
-
-    def test_status_returns_to_idle_after_terminal_result(self):
-        async def scenario(daemon):
-            daemon._on_ir_bind_arm()
-            daemon._on_ir_key("KEY_PLAYPAUSE", False)
-            self.assertEqual(self.status(daemon.mqtt.client),
-                             "bound: KEY_PLAYPAUSE -> volume_up")
-            await asyncio.sleep(hubd.IR_BIND_IDLE_RETURN_S + 0.15)
-            self.assertEqual(self.status(daemon.mqtt.client), "idle")
-
-        original = hubd.IR_BIND_IDLE_RETURN_S
-        hubd.IR_BIND_IDLE_RETURN_S = 0.05
-        try:
-            with HubDaemonFixture() as daemon:
-                asyncio.run(scenario(daemon))
-        finally:
-            hubd.IR_BIND_IDLE_RETURN_S = original
-
-    def test_rearm_blocks_stale_idle_return(self):
-        async def scenario(daemon):
-            daemon._on_ir_bind_arm()
-            daemon._on_ir_key("KEY_PLAYPAUSE", False)  # terminal: bound
-            daemon._on_ir_bind_arm()                   # re-arm before idle return
-            armed = self.status(daemon.mqtt.client)
-            await asyncio.sleep(hubd.IR_BIND_IDLE_RETURN_S + 0.15)
-            # The stale return-to-idle from the bind must not clobber the re-arm.
-            self.assertEqual(self.status(daemon.mqtt.client), armed)
-
-        original = hubd.IR_BIND_IDLE_RETURN_S
-        hubd.IR_BIND_IDLE_RETURN_S = 0.05
-        try:
-            with HubDaemonFixture() as daemon:
-                asyncio.run(scenario(daemon))
-        finally:
-            hubd.IR_BIND_IDLE_RETURN_S = original
-
-
-class TestIRKeyCommand(unittest.TestCase):
-    def test_direct_set_updates_store_and_publishes(self):
-        with HubDaemonFixture() as daemon:
-            daemon._on_ir_key_command("KEY_MUTE", "ducking_toggle")
-            self.assertEqual(daemon.ir_map.get("KEY_MUTE"), "ducking_toggle")
-            topics = daemon.mqtt.client.by_topic()
-            self.assertEqual(topics.get("t_dev/ir/KEY_MUTE/state"), "ducking_toggle")
-
-    def test_direct_set_new_key_publishes_discovery(self):
-        with HubDaemonFixture() as daemon:
-            daemon._on_ir_key_command("KEY_PLAYPAUSE", "ignore")
-            base = daemon.cfg.mqtt_base_topic
-            self.assertIn(f"{base}/select/t_dev_ir_key_playpause/config",
-                          daemon.mqtt.client.by_topic())
-
-    def test_unknown_key_rejected(self):
-        with HubDaemonFixture() as daemon:
-            daemon._on_ir_key_command("NOT_A_KEY_NAME", "volume_up")
-            self.assertIsNone(daemon.ir_map.get("NOT_A_KEY_NAME"))
-            self.assertNotIn("t_dev/ir/NOT_A_KEY_NAME/state",
-                             daemon.mqtt.client.by_topic())
-
-    def test_unknown_action_rejected(self):
-        with HubDaemonFixture() as daemon:
-            daemon._on_ir_key_command("KEY_MUTE", "explode")
-            self.assertEqual(daemon.ir_map.get("KEY_MUTE"), "mute_toggle")
-
-
-class TestIRBindChoose(unittest.TestCase):
-    def test_choose_publishes_state(self):
-        with HubDaemonFixture() as daemon:
-            daemon._on_ir_bind_choose("ducking_toggle")
-            self.assertEqual(daemon._ir_bind_chosen, "ducking_toggle")
-            self.assertEqual(daemon.mqtt.client.by_topic().get("t_dev/ir_bind/choose/state"),
-                             "ducking_toggle")
-
-    def test_invalid_choice_ignored(self):
-        with HubDaemonFixture() as daemon:
-            daemon._on_ir_bind_choose("ignore")     # not a bind target
-            daemon._on_ir_bind_choose("explode")    # not an action
-            self.assertEqual(daemon._ir_bind_chosen, "volume_up")
-
-
-class TestIRDiscovery(unittest.TestCase):
-    def _bridge_with_map(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        old_home = os.environ.get("HOME")
-        os.environ["HOME"] = tmp.name
-        self.addCleanup(setitem_home, old_home)
-        store = hubd.IRMapStore()
-        cfg = make_config()
-        return hubd.MQTTBridge(cfg, store)
-
-    def _discovery(self, bridge):
-        base = bridge.cfg.mqtt_base_topic
-        availability = bridge._availability_topic()
-        device = {"identifiers": ["t_dev"], "name": "T", "model": "m", "manufacturer": "c"}
-        return dict(bridge._ir_discovery(base, "t_dev", availability, device))
-
-    def test_payload_shape_and_topic_names(self):
-        bridge = self._bridge_with_map()
-        base = bridge.cfg.mqtt_base_topic
-        by_topic = self._discovery(bridge)
-
-        vol_up = by_topic[f"{base}/select/t_dev_ir_key_volumeup/config"]
-        self.assertEqual(vol_up["name"], "IR Vol+ Action")
-        self.assertEqual(vol_up["unique_id"], "t_dev_ir_key_volumeup")
-        self.assertEqual(vol_up["state_topic"], "t_dev/ir/KEY_VOLUMEUP/state")
-        self.assertEqual(vol_up["command_topic"], "t_dev/ir/KEY_VOLUMEUP/set")
-        self.assertEqual(vol_up["options"], list(hubd.IR_ACTIONS))
-        self.assertEqual(vol_up["availability_topic"], bridge._availability_topic())
-        self.assertIn("device", vol_up)
-
-        # the three factory keys each get a select
-        for suffix in ("ir_key_volumeup", "ir_key_volumedown", "ir_key_mute"):
-            self.assertIn(f"{base}/select/t_dev_{suffix}/config", by_topic)
-
-        last = by_topic[f"{base}/sensor/t_dev_ir_last_key/config"]
-        self.assertEqual(last["name"], "IR Last Key")
-        self.assertEqual(last["state_topic"], "t_dev/ir_last_key/state")
-
-        choose = by_topic[f"{base}/select/t_dev_ir_bind_choose/config"]
-        self.assertEqual(choose["options"], list(hubd.IR_BIND_ACTIONS))
-        self.assertNotIn("ignore", choose["options"])
-
-        arm = by_topic[f"{base}/button/t_dev_ir_bind_arm/config"]
-        self.assertEqual(arm["payload_press"], "PRESS")
-        self.assertEqual(arm["command_topic"], "t_dev/ir_bind/arm/set")
-
-        status = by_topic[f"{base}/sensor/t_dev_ir_bind_status/config"]
-        self.assertEqual(status["state_topic"], "t_dev/ir_bind/status/state")
-
-    def test_factory_map_drives_entity_set(self):
-        bridge = self._bridge_with_map()
-        base = bridge.cfg.mqtt_base_topic
-        by_topic = self._discovery(bridge)
-        selects = [t for t in by_topic if "/select/" in t and "_ir_" in t
-                   and "bind" not in t]
-        self.assertEqual(len(selects), 3)
-
-    def test_initial_state_publishes_key_states_choose_and_idle(self):
-        bridge = self._bridge_with_map()
-        bridge.client = RecordingClient()
-        bridge.attach_state_provider(lambda: {})
-        bridge._publish_initial_state()
-        topics = bridge.client.by_topic()
-        self.assertEqual(topics.get("t_dev/ir/KEY_VOLUMEUP/state"), "volume_up")
-        self.assertEqual(topics.get("t_dev/ir/KEY_VOLUMEDOWN/state"), "volume_down")
-        self.assertEqual(topics.get("t_dev/ir/KEY_MUTE/state"), "mute_toggle")
-        self.assertEqual(topics.get("t_dev/ir_bind/choose/state"), "volume_up")
-        self.assertEqual(topics.get("t_dev/ir_bind/status/state"), "idle")
 
 
 def setitem_home(value):

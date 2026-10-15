@@ -29,6 +29,7 @@ import glob
 import json
 import logging
 import os
+import re
 import select
 import signal
 import struct
@@ -449,19 +450,19 @@ class SettingsStore:
 # IR Key Mapping
 # -----------------------------------------------------------------------------
 # Key-to-action mapping is data, not code: persisted at
-# ~/.config/audiohub/ir_map.json, editable over MQTT/HA, surviving restarts.
-# The factory map (absent file) is today's behavior.
+# ~/.config/audiohub/ir_map.json (v2 format, spec Section 4.4), editable from
+# HA via the IR editor, surviving restarts. The factory map (absent file) is
+# the out-of-the-box behavior. "none" in the bindings is an explicit
+# tombstone: an unbound factory key must not be re-added by the overlay.
 
 IR_ACTIONS = ("volume_up", "volume_down", "mute_toggle", "ducking_toggle", "ignore")
-# Actions offered by the bind flow ("ignore" is settable only on an existing
-# key's select, never as a bind target).
-IR_BIND_ACTIONS = ("volume_up", "volume_down", "mute_toggle", "ducking_toggle")
 # Actions that repeat while a key is held (EV_KEY value-2), Section 5.4.
 IR_REPEATABLE = ("volume_up", "volume_down")
-# Capture-flow window: how long an armed bind waits for a keypress, Section 5.6.
-IR_BIND_WINDOW_S = 60.0
-# After a terminal bind result, the status sensor returns to idle after this long.
-IR_BIND_IDLE_RETURN_S = 10.0
+# Identify-capture window: how long an armed identify waits for a keypress.
+IR_IDENTIFY_WINDOW_S = 60.0
+# After a terminal identify result, the status sensor returns to idle after
+# this long.
+IR_IDENTIFY_IDLE_RETURN_S = 10.0
 
 IR_FACTORY_MAP = {
     "KEY_VOLUMEUP": "volume_up",
@@ -469,16 +470,51 @@ IR_FACTORY_MAP = {
     "KEY_MUTE": "mute_toggle",
 }
 
-IR_KEY_DISPLAY = {
-    "KEY_VOLUMEUP": "Vol+",
-    "KEY_VOLUMEDOWN": "Vol-",
+IR_KEY_LABELS = {
+    "KEY_VOLUMEUP": "Volume Up",
+    "KEY_VOLUMEDOWN": "Volume Down",
     "KEY_MUTE": "Mute",
 }
 
 
-def ir_key_display(key_name: str) -> str:
-    """Friendly label for the HA entity name; unknown keys use the raw name."""
-    return IR_KEY_DISPLAY.get(key_name, key_name)
+def ir_key_label(key_name: str) -> str:
+    """Human label for the editor's Key select: table for common keys,
+    otherwise the name with KEY_ stripped and title-cased (KEY_F13 -> F13)."""
+    if key_name in IR_KEY_LABELS:
+        return IR_KEY_LABELS[key_name]
+    if key_name.startswith("KEY_"):
+        return key_name[len("KEY_"):].title()
+    return key_name
+
+
+def ir_key_option(key_name: str) -> str:
+    """Select option text: human label plus the canonical name in parentheses,
+    so it reads well and round-trips (Section 4.4)."""
+    return f"{ir_key_label(key_name)} ({key_name})"
+
+
+def ir_parse_key_option(option: str) -> "str | None":
+    """Canonical KEY_* name from a select option (text inside the final
+    parentheses); None if the name is not a real evdev key."""
+    m = re.search(r"\(([^()]*)\)\s*$", option)
+    name = m.group(1) if m else option.strip()
+    code = getattr(evdev.ecodes, name, None)
+    return name if isinstance(code, int) else None
+
+
+# Editor Action select: option label -> action id ("none" = unbound tombstone;
+# the editor cannot set "ignore", which remains valid only in hand-edited
+# files and is displayed as none).
+IR_ACTION_LABELS = {
+    "volume_up": "Volume up",
+    "volume_down": "Volume down",
+    "mute_toggle": "Mute toggle",
+    "ducking_toggle": "Ducking toggle",
+    "none": "None (HA event only)",
+}
+IR_ACTION_BY_OPTION = {v: k for k, v in IR_ACTION_LABELS.items()}
+# Binding values that leave a key inert (event-only).
+IR_INERT = ("none", "ignore")
 
 
 # input-event-codes.h sentinels that share a code with a real key and would
@@ -508,15 +544,36 @@ ECODE_TO_KEY_NAME = _ecode_to_key_name()
 class IRMapStore:
     """IR key-to-action map, persisted to ~/.config/audiohub/ir_map.json
     (same arrangement as SelectionStore: hubd runs unprivileged; thread-safe
-    across the asyncio loop and the IR worker thread). The factory map is
-    overlaid on load, so an absent file is exactly today's behavior."""
+    across the asyncio loop and the IR worker thread).
+
+    v2 file format (spec Section 4.4):
+        {"version": 2,
+         "bindings": {KEY: action_id | "none"},
+         "seen": [KEY, ...]}          most recent first, capped at 32
+
+    "none" is an explicit tombstone: an unbound factory key stays unbound
+    instead of being re-added by the factory overlay. A v1 flat dict (any
+    file without "version": 2) loads as bindings, with v1 "ignore" migrated
+    to "none"; every key name in a v1 file is kept in _legacy_keys BEFORE
+    validation drops malformed entries, so the Layer 1 retirement sweep
+    (Section 4.4) can clear entities for dropped entries too. The file is
+    rewritten as v2 on the next change, never on load."""
+
+    SEEN_CAP = 32
 
     def __init__(self, path: "str | None" = None):
         self.path = path or os.path.expanduser(
             os.path.join("~", ".config", "audiohub", "ir_map.json"))
         self._lock = threading.Lock()
-        self._map: dict = dict(IR_FACTORY_MAP)
+        self._bindings: dict = {}       # file bindings: action id or "none"
+        self._seen: list = []           # most recent first
+        self._legacy_keys: set = set()  # every key name from a pre-migration v1 file
         self._load()
+
+    @staticmethod
+    def _valid_key(key) -> bool:
+        code = getattr(evdev.ecodes, key, None) if isinstance(key, str) else None
+        return isinstance(code, int)
 
     def _load(self):
         try:
@@ -530,37 +587,105 @@ class IRMapStore:
         if not isinstance(data, dict):
             log.warning(f"Ignoring malformed IR map {self.path}: not an object")
             return
+        if data.get("version") == 2:
+            bindings = data.get("bindings", {})
+            seen = data.get("seen", [])
+            if not isinstance(bindings, dict):
+                bindings = {}
+            if not isinstance(seen, list):
+                seen = []
+        else:
+            # v1 flat dict (or unknown format): the whole object is bindings.
+            bindings = data
+            seen = []
+            self._legacy_keys = {k for k in data if isinstance(k, str)}
         with self._lock:
-            for key, action in data.items():
-                if getattr(evdev.ecodes, key, None) is None or not isinstance(
-                        getattr(evdev.ecodes, key), int):
+            for key, action in bindings.items():
+                if not self._valid_key(key):
                     log.warning(f"IR map: dropping unknown key {key!r}")
                     continue
-                if action not in IR_ACTIONS:
+                if action == "ignore":
+                    action = "none"  # v1 migration: ignore -> explicit tombstone
+                if action != "none" and action not in IR_ACTIONS:
                     log.warning(f"IR map: dropping {key!r}: unknown action {action!r}")
                     continue
-                self._map[key] = action
+                self._bindings[key] = action
+            for key in seen:
+                if self._valid_key(key) and key not in self._seen:
+                    self._seen.append(key)
+            del self._seen[self.SEEN_CAP:]
 
     def get(self, key_name: str) -> "str | None":
+        """Effective binding: file entry first (including "none" tombstones,
+        which block the factory overlay), then the factory map, else None."""
         with self._lock:
-            return self._map.get(key_name)
+            if key_name in self._bindings:
+                return self._bindings[key_name]
+        return IR_FACTORY_MAP.get(key_name)
 
     def set(self, key_name: str, action: str):
+        """Record a binding. action is an IR_ACTIONS id or "none" (unbind
+        tombstone). Persists in v2 format."""
+        if action != "none" and action not in IR_ACTIONS:
+            raise ValueError(f"unknown IR action {action!r}")
         with self._lock:
-            self._map[key_name] = action
-            snapshot = dict(self._map)
-        self._persist(snapshot)
+            self._bindings[key_name] = action
+            snapshot = (dict(self._bindings), list(self._seen))
+        self._persist(*snapshot)
 
-    def snapshot(self) -> dict:
+    def record_seen(self, key_name: str) -> bool:
+        """Remember a key seen from the remote (most recent first, capped).
+        Invalid key names are refused so the seen list always reloads
+        losslessly. Returns True if this key was not seen before."""
+        if not self._valid_key(key_name):
+            return False
         with self._lock:
-            return dict(self._map)
+            if key_name in self._seen:
+                return False
+            self._seen.insert(0, key_name)
+            del self._seen[self.SEEN_CAP:]
+            snapshot = (dict(self._bindings), list(self._seen))
+        self._persist(*snapshot)
+        return True
 
-    def _persist(self, snapshot: dict):
+    def seen(self) -> list:
+        with self._lock:
+            return list(self._seen)
+
+    def bindings(self) -> dict:
+        """Raw file bindings (action ids and "none" tombstones)."""
+        with self._lock:
+            return dict(self._bindings)
+
+    def legacy_keys(self) -> set:
+        with self._lock:
+            return set(self._legacy_keys)
+
+    def mapped(self) -> dict:
+        """Effective bindings that carry a real action (tombstones, ignore,
+        and never-bound keys excluded) — the IR Mappings sensor view."""
+        out = {}
+        for key in set(IR_FACTORY_MAP) | set(self._bindings):
+            action = self.get(key)
+            if action is not None and action not in IR_INERT:
+                out[key] = action
+        return out
+
+    def retirement_keys(self) -> set:
+        """Every key that may have an orphaned Layer 1 per-key select entity:
+        v2 file keys (bindings + seen), pre-migration v1 keys (including
+        entries validation dropped), and the factory keys."""
+        with self._lock:
+            keys = set(self._bindings) | set(self._seen) | set(self._legacy_keys)
+        return keys | set(IR_FACTORY_MAP)
+
+    def _persist(self, bindings: dict, seen: list):
         try:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             tmp = self.path + ".tmp"
             with open(tmp, "w") as f:
-                json.dump(snapshot, f, indent=2, sort_keys=True)
+                json.dump({"version": 2, "bindings": bindings, "seen": seen},
+                          f, indent=2, sort_keys=True)
             os.replace(tmp, self.path)
         except Exception as e:
             # Mapping stays effective for this session; the store is
@@ -966,11 +1091,12 @@ class MQTTBridge:
         {id}/setting/{key}/set       runtime setting (Section 4.3; key
                                      "reset" = Reset Settings button)
         {id}/output/set, {id}/tv_source/set   device selection
-        {id}/ir/{KEY}/set            action for a bound IR key
-        {id}/ir_bind/choose/set      bind-flow target action
-        {id}/ir_bind/arm/set         bind-flow arm button (PRESS)
+        {id}/ir_edit/key/set         IR editor: key select (Section 4.4)
+        {id}/ir_edit/action/set      IR editor: action select
+        {id}/ir_edit/identify/set    IR editor: identify button (PRESS)
         {id}/volume/state, {id}/{source}/volume/state, ...
         {id}/setting/{key}/state     state (retained)
+        {id}/ir/event                IR Remote event entity (NOT retained)
     """
 
     def __init__(self, config: HubConfig, ir_map: "IRMapStore | None" = None,
@@ -983,16 +1109,18 @@ class MQTTBridge:
         self._ducking_callback = None
         self._selection_callback = None
         self._setting_callback = None
-        self._ir_key_callback = None
-        self._ir_bind_choose_callback = None
-        self._ir_bind_arm_callback = None
+        self._ir_edit_key_callback = None
+        self._ir_edit_action_callback = None
+        self._ir_edit_identify_callback = None
         self._state_provider = None
         self._selection_provider = None
         self._ir_map = ir_map
         self.settings = settings
-        self._ir_bind_chosen: str | None = IR_BIND_ACTIONS[0]
         # Last known select options; updated by publish_selection_discovery.
         self._selection_options: dict = {"output": [], "tv_source": []}
+        # Last published IR key-option list; publish_ir_editor_options skips
+        # republishing while unchanged.
+        self._ir_options_cache: "list | None" = None
 
     def on_volume_command(self, source: str, callback):
         """Register callback(level: float) for a source or 'master'."""
@@ -1015,17 +1143,17 @@ class MQTTBridge:
         (key 'reset' carries the Reset Settings button press)."""
         self._setting_callback = callback
 
-    def on_ir_key_command(self, callback):
-        """Register callback(key_name: str, action: str) for {id}/ir/{KEY}/set."""
-        self._ir_key_callback = callback
+    def on_ir_edit_key(self, callback):
+        """Register callback(option: str) for {id}/ir_edit/key/set."""
+        self._ir_edit_key_callback = callback
 
-    def on_ir_bind_choose(self, callback):
-        """Register callback(action: str) for {id}/ir_bind/choose/set."""
-        self._ir_bind_choose_callback = callback
+    def on_ir_edit_action(self, callback):
+        """Register callback(option: str) for {id}/ir_edit/action/set."""
+        self._ir_edit_action_callback = callback
 
-    def on_ir_bind_arm(self, callback):
-        """Register callback() for {id}/ir_bind/arm/set."""
-        self._ir_bind_arm_callback = callback
+    def on_ir_edit_identify(self, callback):
+        """Register callback() for {id}/ir_edit/identify/set (PRESS)."""
+        self._ir_edit_identify_callback = callback
 
     def attach_state_provider(self, provider):
         """Register fn() -> dict with current state, published on connect.
@@ -1120,9 +1248,7 @@ class MQTTBridge:
         client.subscribe(f"{self.cfg.device_id}/output/set")
         client.subscribe(f"{self.cfg.device_id}/tv_source/set")
         client.subscribe(f"{self.cfg.device_id}/setting/+/set")
-        client.subscribe(f"{self.cfg.device_id}/ir/+/set")
-        client.subscribe(f"{self.cfg.device_id}/ir_bind/choose/set")
-        client.subscribe(f"{self.cfg.device_id}/ir_bind/arm/set")
+        client.subscribe(f"{self.cfg.device_id}/ir_edit/+/set")
 
         client.publish(self._availability_topic(), "online", retain=True)
         self._publish_discovery(client)
@@ -1158,21 +1284,16 @@ class MQTTBridge:
                     log.warning(f"No volume handler for source '{source}'")
                     return
                 self._emit(lambda: cb(level))
-            # {id}/ir/{KEY}/set -> action for a bound IR key
-            elif len(parts) == 3 and parts[0] == "ir" and parts[2] == "set":
-                if self._ir_key_callback is not None:
-                    key_name = parts[1]
-                    self._emit(lambda: self._ir_key_callback(key_name, payload))
-            # {id}/ir_bind/choose/set -> bind-flow target action
-            elif len(parts) == 3 and parts[0] == "ir_bind" and parts[1] == "choose" \
-                    and parts[2] == "set":
-                if self._ir_bind_choose_callback is not None:
-                    self._emit(lambda: self._ir_bind_choose_callback(payload))
-            # {id}/ir_bind/arm/set -> bind-flow arm button
-            elif len(parts) == 3 and parts[0] == "ir_bind" and parts[1] == "arm" \
-                    and parts[2] == "set":
-                if payload == "PRESS" and self._ir_bind_arm_callback is not None:
-                    self._emit(lambda: self._ir_bind_arm_callback())
+            # {id}/ir_edit/+/set -> IR editor (key select, action select,
+            # identify button), Section 4.4
+            elif len(parts) == 3 and parts[0] == "ir_edit" and parts[2] == "set":
+                if parts[1] == "key" and self._ir_edit_key_callback is not None:
+                    self._emit(lambda: self._ir_edit_key_callback(payload))
+                elif parts[1] == "action" and self._ir_edit_action_callback is not None:
+                    self._emit(lambda: self._ir_edit_action_callback(payload))
+                elif parts[1] == "identify" and payload == "PRESS" \
+                        and self._ir_edit_identify_callback is not None:
+                    self._emit(self._ir_edit_identify_callback)
             # {id}/setting/{key}/set -> runtime setting ("reset" = Reset button)
             elif len(parts) == 3 and parts[0] == "setting" and parts[2] == "set":
                 if self._setting_callback is not None:
@@ -1320,82 +1441,136 @@ class MQTTBridge:
             payload["origin"] = self._origin()
             client.publish(topic, json.dumps(payload), retain=True)
 
+        self._retire_layer1(base, dev_id)
+
         log.info(f"Published {len(entities)} discovery entities")
+
+    def ir_key_options(self) -> list:
+        """Sorted union of factory, bound, and seen keys — the IR: Key select
+        options and the IR Remote event_types list (Section 4.4)."""
+        if self._ir_map is None:
+            return sorted(IR_FACTORY_MAP)
+        keys = (set(IR_FACTORY_MAP)
+                | set(self._ir_map.bindings())
+                | set(self._ir_map.seen()))
+        return sorted(keys)
 
     def _ir_discovery(self, base: str, dev_id: str, availability: str,
                       device: dict) -> list:
-        """HA payloads for the IR entities: one select per bound key, the
-        last-key sensor, and the bind-flow select/button/status trio."""
+        """HA payloads for the IR editor entities and the IR Remote event
+        entity (spec Sections 4.4/4.5). One fixed entity set that edits one
+        mapping at a time — no per-key entities."""
         entities = []
-        ir_map = self._ir_map.snapshot() if self._ir_map is not None else {}
-        for key_name in sorted(ir_map):
-            entities.append(self._ir_key_entity(
-                key_name, base, dev_id, availability, device))
+        key_options = self.ir_key_options()
+        self._ir_options_cache = key_options
+        common = {
+            "availability_topic": availability,
+            "device": device,
+        }
         entities.append((
-            f"{base}/sensor/{dev_id}_ir_last_key/config",
+            f"{base}/select/{dev_id}_ir_edit_key/config",
             {
-                "name": "IR Last Key",
-                "unique_id": f"{dev_id}_ir_last_key",
-                "state_topic": f"{dev_id}/ir_last_key/state",
-                "availability_topic": availability,
+                "name": "IR: Key",
+                "unique_id": f"{dev_id}_ir_edit_key",
+                "state_topic": f"{dev_id}/ir_edit/key/state",
+                "command_topic": f"{dev_id}/ir_edit/key/set",
+                "options": [ir_key_option(k) for k in key_options],
+                "entity_category": "config",
                 "icon": "mdi:remote",
-                "device": device,
+                **common,
             },
         ))
         entities.append((
-            f"{base}/select/{dev_id}_ir_bind_choose/config",
+            f"{base}/select/{dev_id}_ir_edit_action/config",
             {
-                "name": "IR Bind: Action",
-                "unique_id": f"{dev_id}_ir_bind_choose",
-                "state_topic": f"{dev_id}/ir_bind/choose/state",
-                "command_topic": f"{dev_id}/ir_bind/choose/set",
-                "options": list(IR_BIND_ACTIONS),
-                "availability_topic": availability,
+                "name": "IR: Action",
+                "unique_id": f"{dev_id}_ir_edit_action",
+                "state_topic": f"{dev_id}/ir_edit/action/state",
+                "command_topic": f"{dev_id}/ir_edit/action/set",
+                "options": list(IR_ACTION_LABELS.values()),
+                "entity_category": "config",
                 "icon": "mdi:remote",
-                "device": device,
+                **common,
             },
         ))
         entities.append((
-            f"{base}/button/{dev_id}_ir_bind_arm/config",
+            f"{base}/button/{dev_id}_ir_edit_identify/config",
             {
-                "name": "IR Bind: Next Keypress",
-                "unique_id": f"{dev_id}_ir_bind_arm",
-                "command_topic": f"{dev_id}/ir_bind/arm/set",
+                "name": "IR: Identify Button",
+                "unique_id": f"{dev_id}_ir_edit_identify",
+                "command_topic": f"{dev_id}/ir_edit/identify/set",
                 "payload_press": "PRESS",
-                "availability_topic": availability,
+                "entity_category": "config",
                 "icon": "mdi:gesture-tap-button",
-                "device": device,
+                **common,
             },
         ))
         entities.append((
-            f"{base}/sensor/{dev_id}_ir_bind_status/config",
+            f"{base}/sensor/{dev_id}_ir_edit_status/config",
             {
-                "name": "IR Bind Status",
-                "unique_id": f"{dev_id}_ir_bind_status",
-                "state_topic": f"{dev_id}/ir_bind/status/state",
-                "availability_topic": availability,
+                "name": "IR Editor Status",
+                "unique_id": f"{dev_id}_ir_edit_status",
+                "state_topic": f"{dev_id}/ir_edit/status/state",
+                "entity_category": "diagnostic",
                 "icon": "mdi:remote",
-                "device": device,
+                **common,
+            },
+        ))
+        entities.append((
+            f"{base}/sensor/{dev_id}_ir_mappings/config",
+            {
+                "name": "IR Mappings",
+                "unique_id": f"{dev_id}_ir_mappings",
+                "state_topic": f"{dev_id}/ir/mappings/state",
+                "json_attributes_topic": f"{dev_id}/ir/mappings/attributes",
+                "entity_category": "diagnostic",
+                "icon": "mdi:format-list-bulleted",
+                **common,
+            },
+        ))
+        entities.append((
+            f"{base}/event/{dev_id}_ir_remote/config",
+            {
+                "name": "IR Remote",
+                "unique_id": f"{dev_id}_ir_remote",
+                "state_topic": f"{dev_id}/ir/event",
+                "event_types": key_options,
+                "entity_category": "diagnostic",
+                "icon": "mdi:remote",
+                **common,
             },
         ))
         return entities
 
-    def _ir_key_entity(self, key_name: str, base: str, dev_id: str,
-                       availability: str, device: dict) -> tuple:
-        """HA select payload for one bound key's action selector."""
-        return (
-            f"{base}/select/{dev_id}_ir_{key_name.lower()}/config",
-            {
-                "name": f"IR {ir_key_display(key_name)} Action",
-                "unique_id": f"{dev_id}_ir_{key_name.lower()}",
-                "state_topic": f"{dev_id}/ir/{key_name}/state",
-                "command_topic": f"{dev_id}/ir/{key_name}/set",
-                "options": list(IR_ACTIONS),
-                "availability_topic": availability,
-                "icon": "mdi:remote",
-                "device": device,
-            },
-        )
+    def _retire_layer1(self, base: str, dev_id: str):
+        """Retire Layer 1's per-key select entities and bind-flow trio with
+        empty retained payloads (spec Section 4.4). The key set is every key
+        that may ever have had a select: v2 file keys, factory keys, and
+        every key name in the pre-migration v1 file (including entries
+        validation dropped). Retained per-key state payloads are cleared in
+        the same sweep. Idempotent; runs every start, so units that skipped
+        Layer 1 are unaffected."""
+        if self.client is None:
+            return
+        keys = (self._ir_map.retirement_keys()
+                if self._ir_map is not None else set(IR_FACTORY_MAP))
+        configs = [f"{base}/select/{dev_id}_ir_{k.lower()}/config"
+                   for k in sorted(keys)]
+        configs += [
+            f"{base}/select/{dev_id}_ir_bind_choose/config",
+            f"{base}/button/{dev_id}_ir_bind_arm/config",
+            f"{base}/sensor/{dev_id}_ir_bind_status/config",
+            f"{base}/sensor/{dev_id}_ir_last_key/config",
+        ]
+        try:
+            for topic in configs:
+                self.client.publish(topic, "", retain=True)
+            for key in sorted(keys):
+                self.client.publish(f"{dev_id}/ir/{key}/state", "", retain=True)
+        except Exception as e:
+            log.warning(f"Layer 1 retirement sweep failed: {e}")
+            return
+        log.info(f"Retired {len(configs)} Layer 1 IR entities")
 
     def _selection_discovery(self, base: str, dev_id: str, availability: str,
                              device: dict) -> list:
@@ -1559,10 +1734,13 @@ class MQTTBridge:
             for key in SETTING_DEFS:
                 self.publish_setting_state(key, self.settings.get(key))
         if self._ir_map is not None:
-            for key_name, action in sorted(self._ir_map.snapshot().items()):
-                self.publish_ir_key_state(key_name, action)
-            self.publish_ir_bind_choose(self._ir_bind_chosen or IR_BIND_ACTIONS[0])
-            self.publish_ir_bind_status("idle")
+            options = self.ir_key_options()
+            default = options[0] if options else None
+            self.publish_ir_edit_key_state(default)
+            self.publish_ir_edit_action_state(
+                self._ir_map.get(default) if default else None)
+            self.publish_ir_edit_status("idle")
+            self.publish_ir_mappings()
 
     def publish_volume(self, source: str, level: float):
         topic = (
@@ -1602,33 +1780,74 @@ class MQTTBridge:
             payload = str(value)
         self._publish(f"{self.cfg.device_id}/setting/{key}/state", payload)
 
-    # -- IR state publishing (asyncio loop thread) -------------------------------
-    def publish_ir_key_state(self, key_name: str, action: str):
-        self._publish(f"{self.cfg.device_id}/ir/{key_name}/state", action)
+    # -- IR editor + event publishing (asyncio loop thread) ----------------------
+    def publish_ir_edit_key_state(self, key_name: "str | None"):
+        """Echo the IR: Key select. The payload is the option text
+        ("F13 (KEY_F13)"); None skips (nothing selected yet)."""
+        if key_name is None:
+            return
+        self._publish(f"{self.cfg.device_id}/ir_edit/key/state",
+                      ir_key_option(key_name))
 
-    def publish_ir_last_key(self, key_name: str):
-        self._publish(f"{self.cfg.device_id}/ir_last_key/state", key_name)
+    def publish_ir_edit_action_state(self, action: "str | None"):
+        """Echo the IR: Action select for the selected key. None (unbound)
+        and "ignore" (valid only in hand-edited files) display as the None
+        option."""
+        if action is None:
+            option = IR_ACTION_LABELS["none"]
+        else:
+            option = IR_ACTION_LABELS.get(action, IR_ACTION_LABELS["none"])
+        self._publish(f"{self.cfg.device_id}/ir_edit/action/state", option)
 
-    def publish_ir_bind_status(self, status: str):
-        self._publish(f"{self.cfg.device_id}/ir_bind/status/state", status)
+    def publish_ir_edit_status(self, status: str):
+        self._publish(f"{self.cfg.device_id}/ir_edit/status/state", status)
 
-    def publish_ir_bind_choose(self, action: str):
-        self._ir_bind_chosen = action
-        self._publish(f"{self.cfg.device_id}/ir_bind/choose/state", action)
+    def publish_ir_mappings(self):
+        """IR Mappings sensor: state = mapping count, attributes = JSON
+        {label: action} of every effective real binding (Section 4.4)."""
+        if self._ir_map is None:
+            return
+        attrs = {ir_key_label(k): a
+                 for k, a in sorted(self._ir_map.mapped().items())}
+        self._publish(f"{self.cfg.device_id}/ir/mappings/state", str(len(attrs)))
+        self._publish(f"{self.cfg.device_id}/ir/mappings/attributes",
+                      json.dumps(attrs))
 
-    def publish_ir_key_discovery(self, key_name: str):
-        """(Re)publish one key's select entity — used when a key is newly
-        bound via the capture flow (or direct set)."""
+    def publish_ir_editor_options(self):
+        """Republish the IR: Key select and IR Remote event entities when the
+        key set changed (a new key was seen). Called before the event is
+        published so HA has the extended event_types (Section 4.5)."""
         if self.client is None:
             return
+        options = self.ir_key_options()
+        if options == self._ir_options_cache:
+            return
+        self._ir_options_cache = options
         base = self.cfg.mqtt_base_topic
         dev_id = self.cfg.device_id
         availability = self._availability_topic()
         device = self._device_block()
-        topic, payload = self._ir_key_entity(
-            key_name, base, dev_id, availability, device)
-        payload["origin"] = self._origin()
-        self._publish(topic, json.dumps(payload))
+        for topic, payload in self._ir_discovery(base, dev_id, availability, device):
+            payload["origin"] = self._origin()
+            self._publish(topic, json.dumps(payload))
+        log.info(f"IR key set changed; republished editor discovery "
+                 f"({len(options)} keys)")
+
+    def publish_ir_event(self, key_name: str, action: "str | None"):
+        """IR Remote event for a real press — not retained (Section 4.5).
+        Mapped keys fire the event as well as the local action."""
+        payload = json.dumps({
+            "event_type": key_name,
+            "action": action if action else "none",
+            "label": ir_key_label(key_name),
+        })
+        if self.client is None:
+            return
+        try:
+            self.client.publish(f"{self.cfg.device_id}/ir/event", payload,
+                                retain=False)
+        except Exception as e:
+            log.debug(f"Publish IR event failed: {e}")
 
     def _publish(self, topic: str, payload: str):
         if self.client is None:
@@ -1967,13 +2186,13 @@ class HubDaemon:
         # EFFECTIVE selection (what the graph is actually fed).
         self._sel_options: dict = {"output": [], "tv_source": []}
         self._sel_effective: dict = {"output": None, "tv_source": None}
-        # IR state: first-sighting dedup for unmapped keys, the armed bind
-        # window, the action currently chosen in the HA bind select, a
-        # generation counter guarding the delayed return-to-idle publish,
-        # and per-key last-repeat timestamps for the rate limiter (5.4).
+        # IR state: first-sighting dedup for unmapped keys, the key currently
+        # selected in the IR editor, the armed identify window, a generation
+        # counter guarding the delayed return-to-idle publish, and per-key
+        # last-repeat timestamps for the rate limiter (Section 5.4).
         self._ir_unmapped_seen: set[str] = set()
-        self._ir_bind: "dict | None" = None
-        self._ir_bind_chosen: str = IR_BIND_ACTIONS[0]
+        self._ir_edit_key: "str | None" = None
+        self._ir_identify: "dict | None" = None
         self._ir_status_generation = 0
         self._ir_last_repeat: dict[str, float] = {}
 
@@ -1986,9 +2205,9 @@ class HubDaemon:
         self.mqtt.on_ducking_command(self._on_ducking_command)
         self.mqtt.on_selection_command(self._on_selection_command)
         self.mqtt.on_setting_command(self._on_setting_command)
-        self.mqtt.on_ir_key_command(self._on_ir_key_command)
-        self.mqtt.on_ir_bind_choose(self._on_ir_bind_choose)
-        self.mqtt.on_ir_bind_arm(self._on_ir_bind_arm)
+        self.mqtt.on_ir_edit_key(self._on_ir_edit_key)
+        self.mqtt.on_ir_edit_action(self._on_ir_edit_action)
+        self.mqtt.on_ir_edit_identify(self._on_ir_edit_identify)
         self.mqtt.attach_state_provider(self._snapshot)
         self.mqtt.attach_selection_provider(self._selection_snapshot)
 
@@ -2089,16 +2308,17 @@ class HubDaemon:
     # -- IR key handling (loop thread) -----------------------------------------------
     def _on_ir_key(self, key_name: str, is_repeat: bool):
         """Every event the remote emits, mapped or not. All decisions live
-        here (loop thread): bind-capture capture, last-key observability,
-        map lookup, repeat gating, unmapped-key logging, dispatch."""
+        here (loop thread): seen tracking, identify-capture capture, event
+        publishing, map lookup, repeat gating, unmapped-key logging,
+        dispatch (Sections 4.4/4.5)."""
         if is_repeat:
             # Auto-repeat fires only volume actions, only when enabled, and
-            # never during an armed bind window (5.4 / 5.6). Rate-limited
-            # per key: the kernel delivers value-2 events at ~30 Hz; only
-            # one step per ir_repeat_interval_ms is dispatched. Repeat
-            # steps stay off MQTT (the 2 s state sync publishes the final
-            # value); a real press still publishes immediately.
-            if self._ir_bind is not None:
+            # never during an armed identify window (5.4). Rate-limited per
+            # key: the kernel delivers value-2 events at ~30 Hz; only one
+            # step per ir_repeat_interval_ms is dispatched. Repeat steps
+            # stay off MQTT (the 2 s state sync publishes the final value)
+            # and never fire IR Remote events.
+            if self._ir_identify is not None:
                 return
             action = self.ir_map.get(key_name)
             if action in IR_REPEATABLE and self.settings.get("ir_repeat"):
@@ -2109,15 +2329,18 @@ class HubDaemon:
                 self._ir_last_repeat[key_name] = now
                 self._ir_dispatch(action, publish=False)
             return
-        # Real press: observable regardless of mapping; capture wins over
-        # dispatch so the binding press never fires its own action.
-        self.mqtt.publish_ir_last_key(key_name)
-        bind = self._ir_bind
-        if bind is not None:
-            self._ir_bind_commit(key_name)
+        # Real press: the key becomes seen first, so the Key select options
+        # and event_types grow before the event is published (Section 4.5).
+        if self.ir_map.record_seen(key_name):
+            self.mqtt.publish_ir_editor_options()
+        # Capture wins over event/dispatch: the identify press is consumed,
+        # never fires its own action, and never publishes an event.
+        if self._ir_identify is not None:
+            self._ir_identify_capture(key_name)
             return
         action = self.ir_map.get(key_name)
-        if action is None:
+        self.mqtt.publish_ir_event(key_name, action)
+        if action is None or action in IR_INERT:
             if key_name not in self._ir_unmapped_seen:
                 self._ir_unmapped_seen.add(key_name)
                 log.info(f"IR: unmapped key {key_name} seen")
@@ -2134,82 +2357,94 @@ class HubDaemon:
         elif action == "ducking_toggle":
             current = self.ducking.ducking_enabled if self.ducking is not None else True
             self._on_ducking_command(not current)
-        # "ignore" is bound but inert
+        # "ignore"/"none" are inert (event-only)
 
-    def _on_ir_key_command(self, key_name: str, action: str):
-        """HA select command for one bound key's action."""
-        code = getattr(evdev.ecodes, key_name, None)
-        if not isinstance(code, int):
-            log.warning(f"Ignoring IR action for unknown key {key_name!r}")
-            return
-        if action not in IR_ACTIONS:
-            log.warning(f"Ignoring IR action {action!r} for {key_name}: unknown")
-            return
-        newly_bound = self.ir_map.get(key_name) is None
-        self.ir_map.set(key_name, action)
-        if newly_bound:
-            self.mqtt.publish_ir_key_discovery(key_name)
-        self.mqtt.publish_ir_key_state(key_name, action)
-        log.info(f"IR: {key_name} -> {action}")
+    # -- IR editor (loop thread) ------------------------------------------------------
+    def _ir_editor_default_key(self) -> "str | None":
+        """Key the Action select edits when no key was picked yet: the first
+        option of the key set, matching the connect-time echo."""
+        options = self.mqtt.ir_key_options()
+        return options[0] if options else None
 
-    # -- IR bind capture (loop thread) ------------------------------------------------
-    def _on_ir_bind_choose(self, action: str):
-        if action not in IR_BIND_ACTIONS:
-            log.warning(f"Ignoring IR bind action {action!r}: unknown")
+    def _on_ir_edit_key(self, option: str):
+        """IR: Key select command: select the key and show its current
+        action (Section 4.4 editing flow, step 1)."""
+        key = ir_parse_key_option(option)
+        if key is None:
+            log.warning(f"Ignoring IR editor key {option!r}: unknown key")
             return
-        self._ir_bind_chosen = action
-        self.mqtt.publish_ir_bind_choose(action)
+        self._ir_edit_key = key
+        self.mqtt.publish_ir_edit_key_state(key)
+        self.mqtt.publish_ir_edit_action_state(self.ir_map.get(key))
+        log.info(f"IR editor: key {key}")
 
-    def _on_ir_bind_arm(self):
+    def _on_ir_edit_action(self, option: str):
+        """IR: Action select command: apply and persist immediately, no Save
+        button (Section 4.4 editing flow, step 2). "None" unbinds the key
+        (explicit tombstone); the key stays listed and keeps firing events."""
+        action = IR_ACTION_BY_OPTION.get(option)
+        if action is None:
+            log.warning(f"Ignoring IR editor action {option!r}: unknown")
+            return
+        key = self._ir_edit_key or self._ir_editor_default_key()
+        if key is None:
+            log.warning("Ignoring IR editor action: no key selected")
+            return
+        self._ir_edit_key = key
+        self.ir_map.set(key, action)
+        self.mqtt.publish_ir_edit_action_state(action)
+        self.mqtt.publish_ir_mappings()
+        log.info(f"IR editor: {key} -> {action}")
+
+    def _on_ir_edit_identify(self):
+        """IR: Identify Button press: arm the capture window (Section 4.4
+        identify flow, step 1)."""
         self._ir_status_generation += 1
-        self._ir_bind = {
-            "action": self._ir_bind_chosen,
-            "deadline": time.monotonic() + IR_BIND_WINDOW_S,
-        }
-        self.mqtt.publish_ir_bind_status(f"armed: {self._ir_bind_chosen}")
-        log.info(f"IR bind armed: waiting for a keypress for "
-                 f"{self._ir_bind_chosen} ({IR_BIND_WINDOW_S:.0f} s window)")
+        self._ir_identify = {"deadline": time.monotonic() + IR_IDENTIFY_WINDOW_S}
+        self.mqtt.publish_ir_edit_status(
+            "Press a button on the remote (60 s)")
+        log.info(f"IR identify armed: waiting for a keypress "
+                 f"({IR_IDENTIFY_WINDOW_S:.0f} s window)")
 
-    def _ir_bind_commit(self, key_name: str):
-        bind = self._ir_bind
-        if bind is None:
-            return
-        action = bind["action"]
-        self._ir_bind = None
+    def _ir_identify_capture(self, key_name: str):
+        """A real press during the identify window: select the key, show its
+        current action, never change the mapping (Section 4.4, step 2)."""
+        self._ir_identify = None
         self._ir_status_generation += 1
         gen = self._ir_status_generation
-        self.ir_map.set(key_name, action)
-        self.mqtt.publish_ir_key_discovery(key_name)
-        self.mqtt.publish_ir_key_state(key_name, action)
-        self.mqtt.publish_ir_bind_status(f"bound: {key_name} -> {action}")
-        log.info(f"IR bind: {key_name} -> {action}")
-        self._ir_bind_idle_later(gen)
+        self._ir_edit_key = key_name
+        self.mqtt.publish_ir_edit_key_state(key_name)
+        self.mqtt.publish_ir_edit_action_state(self.ir_map.get(key_name))
+        self.mqtt.publish_ir_edit_status(
+            f"Captured: {ir_key_label(key_name)} ({key_name}), choose an action")
+        log.info(f"IR identify captured {key_name}")
+        self._ir_idle_later(gen)
 
-    def _ir_bind_expire(self):
-        """Bind window elapsed with no keypress."""
-        self._ir_bind = None
+    def _ir_identify_expire(self):
+        """Identify window elapsed with no keypress."""
+        self._ir_identify = None
         self._ir_status_generation += 1
         gen = self._ir_status_generation
-        self.mqtt.publish_ir_bind_status("timeout")
-        log.info("IR bind: timed out")
-        self._ir_bind_idle_later(gen)
+        self.mqtt.publish_ir_edit_status("timeout")
+        log.info("IR identify: timed out")
+        self._ir_idle_later(gen)
 
-    def _ir_bind_idle_later(self, gen: int):
-        """Return the status sensor to idle after 10 s unless a newer bind
-        transition happened in the meantime."""
+    def _ir_idle_later(self, gen: int):
+        """Return the editor status to idle after 10 s unless a newer
+        identify transition happened in the meantime."""
         def to_idle():
-            if self._ir_status_generation == gen and self._ir_bind is None:
-                self.mqtt.publish_ir_bind_status("idle")
+            if self._ir_status_generation == gen and self._ir_identify is None:
+                self.mqtt.publish_ir_edit_status("idle")
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        loop.call_later(IR_BIND_IDLE_RETURN_S, to_idle)
+        loop.call_later(IR_IDENTIFY_IDLE_RETURN_S, to_idle)
 
-    def _ir_bind_tick(self):
-        bind = self._ir_bind
-        if bind is not None and time.monotonic() >= bind["deadline"]:
-            self._ir_bind_expire()
+    def _ir_identify_tick(self):
+        if self._ir_identify is not None \
+                and time.monotonic() >= self._ir_identify["deadline"]:
+            self._ir_identify_expire()
 
     def _ir_step(self, sign: int, publish: bool = True):
         current = self.audio.get_lineout_volume()
@@ -2327,9 +2562,9 @@ class HubDaemon:
             except Exception as e:
                 log.debug(f"selection reconcile error: {e}")
             try:
-                self._ir_bind_tick()
+                self._ir_identify_tick()
             except Exception as e:
-                log.debug(f"ir bind tick error: {e}")
+                log.debug(f"ir identify tick error: {e}")
             snap = {}
             for source, bus in (("tv", self.cfg.bus_tv), ("bt", self.cfg.bus_bt),
                                 ("music", self.cfg.bus_music)):

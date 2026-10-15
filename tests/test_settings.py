@@ -353,7 +353,8 @@ class TestDiscoveryCategories(unittest.TestCase):
         daemon.mqtt._publish_discovery(daemon.mqtt.client)
         out = {}
         for topic, payload in daemon.mqtt.client.published:
-            if topic.endswith("/config"):
+            # empty payloads are Layer 1 retirement tombstones, not configs
+            if topic.endswith("/config") and payload:
                 out[topic] = json.loads(payload)
         return out
 
